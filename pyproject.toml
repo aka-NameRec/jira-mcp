@@ -1,0 +1,22 @@
+[project]
+name = "jira-mcp"
+version = "0.1.0"
+description = "A focused MCP server for Jira issue review workflows"
+readme = "README.md"
+authors = [
+    { name = "aka.namerec", email = "aka.namerec@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+]
+
+[project.scripts]
+jira-mcp = "jira_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"

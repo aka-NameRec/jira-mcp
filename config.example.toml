@@ -1,0 +1,5 @@
+[jira]
+profiles = [
+  { base_url = "https://jira.example.corp", token = "replace-with-dc-token", deployment = "dc", auth_type = "bearer", issue_key_prefixes = ["BL"] },
+  { name = "example-cloud", base_url = "https://example.atlassian.net", email = "user@example.com", token = "replace-with-classic-cloud-token", deployment = "cloud", auth_type = "basic", issue_key_prefixes = ["ALS"] }
+]
