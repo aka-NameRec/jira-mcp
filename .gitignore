@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# Local project memory
+context_portal/
+
 # Local secrets
 .env

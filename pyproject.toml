@@ -1,6 +1,6 @@
 [project]
 name = "jira-mcp"
-version = "0.1.0"
+version = "0.1"
 description = "A focused MCP server for Jira issue review workflows"
 readme = "README.md"
 authors = [
@@ -12,10 +12,14 @@ dependencies = [
     "mcp>=1.26.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.13.1",
+    "typer>=0.16.1",
 ]
 
 [project.scripts]
-jira-mcp = "jira_mcp.server:main"
+jira-mcp = "jira_mcp.__main__:main"
+
+[tool.jira_mcp]
+release_date = "2026-03-26"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
