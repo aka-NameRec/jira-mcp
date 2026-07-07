@@ -149,6 +149,21 @@ def test_add_comment_adf_body_for_cloud() -> None:
     assert body["content"][0]["content"][0]["text"] == "hi"
 
 
+def test_delete_comment_issues_delete() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.delete_comment("BL-1", "555")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "DELETE"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/comment/555")
+
+
 def test_transition_issue_posts_transition_and_comment() -> None:
     seen, handler = _capture(204)
 

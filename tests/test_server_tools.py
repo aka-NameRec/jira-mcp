@@ -37,6 +37,9 @@ class FakeAdapter:
         self.calls.append(("comment", issue_key, body))
         return {"id": "555"}
 
+    async def delete_comment(self, issue_key: str, comment_id: str) -> None:
+        self.calls.append(("delete_comment", issue_key, comment_id))
+
     async def get_transitions(self, issue_key: str) -> dict[str, Any]:
         return {"transitions": [{"id": "31", "name": "Done"}]}
 
@@ -114,6 +117,13 @@ def test_update_issue_requires_something_to_change(fake: FakeAdapter) -> None:
 def test_add_comment_returns_comment_id(fake: FakeAdapter) -> None:
     result = asyncio.run(_fn(server.add_comment)("BL-1", "hi", None))
     assert fake.calls == [("comment", "BL-1", "hi")]
+    assert result["comment_id"] == "555"
+
+
+def test_delete_comment_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.delete_comment)("BL-1", "555", None))
+    assert fake.calls == [("delete_comment", "BL-1", "555")]
+    assert result["status"] == "comment_deleted"
     assert result["comment_id"] == "555"
 
 

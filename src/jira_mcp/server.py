@@ -23,8 +23,9 @@ mcp = FastMCP(
     instructions=(
         "Focused Jira MCP server for requirement review and editing workflows. "
         "Resolve Jira profiles from issue URLs or configured issue key prefixes. "
-        "Write tools (update_issue, add_comment, transition_issue, create_issue) "
-        "modify real Jira issues; use them only with explicit user intent."
+        "Write tools (update_issue, add_comment, delete_comment, transition_issue, "
+        "create_issue) modify real Jira issues; use them only with explicit user intent. "
+        "delete_comment is destructive and irreversible."
     ),
     json_response=True,
 )
@@ -194,6 +195,30 @@ async def add_comment(issue_key_or_url: str, body: str, ctx: Context) -> dict[st
                 "issue_key": issue_key,
                 "status": "commented",
                 "comment_id": created.get("id"),
+                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def delete_comment(issue_key_or_url: str, comment_id: str, ctx: Context) -> dict[str, Any]:
+    """Delete a comment from a Jira issue. DESTRUCTIVE and irreversible.
+
+    Pass the comment id (e.g. from get_issue_for_review). Only the given comment is removed;
+    the issue itself is untouched. Confirm intent before calling.
+    """
+    del ctx
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            await adapter.delete_comment(issue_key, str(comment_id))
+            return {
+                "issue_key": issue_key,
+                "status": "comment_deleted",
+                "comment_id": str(comment_id),
                 "url": f"{profile.normalized_base_url}/browse/{issue_key}",
             }
         finally:

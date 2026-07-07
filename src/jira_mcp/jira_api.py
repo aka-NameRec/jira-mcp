@@ -37,6 +37,8 @@ class JiraAdapter(Protocol):
 
     async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]: ...
 
+    async def delete_comment(self, issue_key: str, comment_id: str) -> None: ...
+
     async def transition_issue(
         self, issue_key: str, transition_id: str, *, comment: str | None = None
     ) -> None: ...
@@ -174,6 +176,10 @@ class BaseJiraApiClient:
         return await self._request(
             "POST", f"/issue/{issue_key}/comment", json={"body": self._comment_body(body)}
         )
+
+    async def delete_comment(self, issue_key: str, comment_id: str) -> None:
+        # DELETE returns 204 No Content on success.
+        await self._send("DELETE", f"/issue/{issue_key}/comment/{comment_id}")
 
     async def transition_issue(
         self, issue_key: str, transition_id: str, *, comment: str | None = None
