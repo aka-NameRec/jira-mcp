@@ -21,11 +21,25 @@ from .normalizers import normalize_issue_for_review
 mcp = FastMCP(
     "Jira Review",
     instructions=(
-        "Focused Jira MCP server for requirement review and editing workflows. "
-        "Resolve Jira profiles from issue URLs or configured issue key prefixes. "
-        "Write tools (update_issue, add_comment, delete_comment, transition_issue, "
-        "create_issue) modify real Jira issues; use them only with explicit user intent. "
-        "delete_comment is destructive and irreversible."
+        "Focused Jira MCP for reviewing and editing issues. Resolve profiles from issue "
+        "URLs or configured issue-key prefixes.\n"
+        "Read tools (get_issue_for_review, parse_issue_url, list_transitions, my_issues) do "
+        "not mutate. Write tools (update_issue, add_comment, delete_comment, "
+        "transition_issue, create_issue) change real issues — use only with explicit user "
+        "intent, and confirm before destructive or hard-to-reverse actions.\n"
+        "Operational notes:\n"
+        "- update_issue SETS fields and replaces multi-value fields (labels, components); use "
+        "add/remove to change them without clobbering existing values.\n"
+        "- Transitions are state- and permission-dependent and often one-way: call "
+        "list_transitions first; reverting a status can take several hops.\n"
+        "- transition_issue posts its optional comment as a separate comment (reliable), not "
+        "embedded in the transition payload.\n"
+        "- Sub-tasks cannot nest: create with a sub-task issue type and fields.parent under a "
+        "standard (non-sub-task) issue.\n"
+        "- Assignee: Data Center uses fields.assignee.name (username, often the email); Cloud "
+        "uses accountId.\n"
+        "- delete_comment is irreversible; create_issue has no delete (cancel instead); "
+        "notify_users=false needs Jira admin rights."
     ),
     json_response=True,
 )

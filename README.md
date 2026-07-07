@@ -12,14 +12,28 @@ The goal is not broad Jira administration. The goal is to give an agent just eno
 
 ## Tooling Scope
 
-Current tools:
-- `parse_issue_url`
-- `get_issue_for_review`
+Read-only:
+- `parse_issue_url` — parse a Jira URL into a stable issue reference.
+- `get_issue_for_review` — compact issue + comments + attachments + linked work.
+- `list_transitions` — workflow transitions available from the issue's current status.
+- `my_issues` — issues assigned to the current user across all configured profiles.
 
-Planned extension path:
-- reading issue context in a compact review-oriented shape;
-- creating Jira comments for review follow-up;
-- attachment-aware research flows when that becomes necessary.
+Write (mutate real Jira — use with explicit intent):
+- `update_issue` — set fields; `add` / `remove` change multi-value fields via Jira's update verb without clobbering.
+- `add_comment`, `delete_comment` (destructive), `transition_issue` (by id/name, optional comment), `create_issue`.
+
+## Usage & safety
+
+Write tools change real Jira issues. Use them only with explicit user intent and confirm before destructive or hard-to-reverse actions.
+
+- **Read-modify-write for multi-value fields.** `update_issue` SETS fields and replaces multi-value fields (`labels`, `components`, `fixVersions`) and `description`. To change multi-value fields without clobbering, use `add` / `remove` (Jira update verb); each value may be a scalar or a list.
+- **Transitions.** State- and permission-dependent and often one-way. Call `list_transitions` first; reverting a status can take several hops. `transition_issue`'s optional `comment` is posted as a separate comment, so a transition screen without a comment field never silently drops it.
+- **Sub-tasks cannot nest.** Create a sub-task with a sub-task issue type and `fields={"parent": {"key": "<PARENT>"}}` under a standard (non-sub-task) issue.
+- **Assignee.** Data Center: `fields={"assignee": {"name": "<username>"}}` (often the email). Cloud: `accountId`.
+- **Irreversibility.** `delete_comment` is permanent; `create_issue` has no delete (cancel instead).
+- **`notify_users=false`** requires Jira admin rights (403 otherwise) — leave the default.
+- **Field aliases.** `update_issue` / `create_issue` accept `acceptance_criteria` / `business_context` / `design_links`, mapped to the profile's `field_mappings` customfield ids.
+- **Cloud caveat.** Live-tested on Data Center (API v2). On Cloud (v3), `my_issues` uses the deprecated `GET /search` and ADF wrapping covers `description` but not rich-text customfields.
 
 ## Why This Exists
 
@@ -124,6 +138,14 @@ uv run jira-mcp
 ```
 
 The server uses stdio transport by default, which is the expected transport for a local MCP server in agent environments.
+
+## Tests
+
+```bash
+uv run --with pytest pytest
+```
+
+Mock-based suite (httpx `MockTransport`) covering request shapes, field-alias translation, transition resolution, `my_issues` merge, and error paths.
 
 ## Install From GitHub URL
 
