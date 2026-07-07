@@ -20,6 +20,20 @@ class JiraAdapter(Protocol):
 
     async def get_issue(self, issue_key: str) -> dict[str, Any]: ...
 
+    async def get_transitions(self, issue_key: str) -> dict[str, Any]: ...
+
+    async def update_issue(
+        self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True
+    ) -> None: ...
+
+    async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]: ...
+
+    async def transition_issue(
+        self, issue_key: str, transition_id: str, *, comment: str | None = None
+    ) -> None: ...
+
+    async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]: ...
+
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None: ...
 
     def build_api_issue_url(self, issue_key: str) -> str: ...
@@ -55,7 +69,7 @@ class BaseJiraApiClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         response = await self._client.request(method, path, **kwargs)
         try:
             response.raise_for_status()
@@ -66,7 +80,21 @@ class BaseJiraApiClient:
             raise JiraApiError(
                 f"Jira API request failed with {response.status_code}: {detail or exc!s}"
             ) from exc
+        return response
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        response = await self._send(method, path, **kwargs)
         return response.json()
+
+    def _comment_body(self, text: str) -> Any:
+        # Data Center / API v2 accepts a plain string; Cloud / API v3 needs an ADF document.
+        if self.api_version == "3":
+            return {
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+            }
+        return text
 
     async def get_issue(self, issue_key: str) -> dict[str, Any]:
         return await self._request(
@@ -81,6 +109,39 @@ class BaseJiraApiClient:
                 ),
             },
         )
+
+    async def get_transitions(self, issue_key: str) -> dict[str, Any]:
+        return await self._request(
+            "GET", f"/issue/{issue_key}/transitions", params={"expand": "transitions.fields"}
+        )
+
+    async def update_issue(
+        self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True
+    ) -> None:
+        # PUT returns 204 No Content on success.
+        await self._send(
+            "PUT",
+            f"/issue/{issue_key}",
+            params={"notifyUsers": "true" if notify_users else "false"},
+            json={"fields": fields},
+        )
+
+    async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
+        return await self._request(
+            "POST", f"/issue/{issue_key}/comment", json={"body": self._comment_body(body)}
+        )
+
+    async def transition_issue(
+        self, issue_key: str, transition_id: str, *, comment: str | None = None
+    ) -> None:
+        # POST returns 204 No Content on success.
+        payload: dict[str, Any] = {"transition": {"id": str(transition_id)}}
+        if comment:
+            payload["update"] = {"comment": [{"add": {"body": self._comment_body(comment)}}]}
+        await self._send("POST", f"/issue/{issue_key}/transitions", json=payload)
+
+    async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/issue", json={"fields": fields})
 
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None:
         if not maybe_relative_url:
