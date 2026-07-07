@@ -236,6 +236,38 @@ def test_search_issues_reads_with_params() -> None:
     assert result["total"] == 0
 
 
+def test_get_myself_reads() -> None:
+    seen, handler = _capture(200, json_body={"name": "u", "displayName": "U"})
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler)
+        try:
+            return await adapter.get_myself()
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/api/2/myself")
+    assert result["name"] == "u"
+
+
+def test_get_create_meta_reads_with_params() -> None:
+    seen, handler = _capture(200, json_body={"projects": []})
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.get_create_meta("BL", expand="projects.issuetypes")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["path"].endswith("/rest/api/2/issue/createmeta")
+    assert seen["params"]["projectKeys"] == "BL"
+    assert seen["params"]["expand"] == "projects.issuetypes"
+
+
 def test_non_2xx_raises_jira_api_error() -> None:
     _, handler = _capture(400, text="Field 'summary' is required")
 

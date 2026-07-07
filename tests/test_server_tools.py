@@ -68,6 +68,40 @@ class FakeAdapter:
             ]
         }
 
+    async def get_myself(self) -> dict[str, Any]:
+        return {
+            "name": "asataev@devcats.kg",
+            "displayName": "Adilet Sataev",
+            "emailAddress": "asataev@devcats.kg",
+        }
+
+    async def get_create_meta(self, project_key: str, *, expand: str | None = None) -> dict[str, Any]:
+        return {
+            "projects": [
+                {
+                    "key": project_key,
+                    "issuetypes": [
+                        {
+                            "id": "10",
+                            "name": "Dev SubTask",
+                            "subtask": True,
+                            "fields": {
+                                "summary": {"name": "Summary", "required": True},
+                                "parent": {"name": "Parent", "required": True},
+                                "labels": {"name": "Labels", "required": False},
+                            },
+                        },
+                        {
+                            "id": "11",
+                            "name": "Dev Task",
+                            "subtask": False,
+                            "fields": {"summary": {"name": "Summary", "required": True}},
+                        },
+                    ],
+                }
+            ]
+        }
+
 
 def _fn(tool: Any):
     """Return the underlying coroutine function whether mcp.tool() returns it raw or wrapped."""
@@ -228,3 +262,28 @@ def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest
     assert [i["key"] for i in result["issues"]] == ["A-2", "A-1"]  # global sort by updated desc
     assert len(result["errors"]) == 1  # bad profile isolated, not fatal
     assert result["errors"][0]["profile"] == p_bad.resolved_name
+
+
+def test_whoami_lists_current_user(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.whoami)(None))
+    assert result["users"][0]["name"] == "asataev@devcats.kg"
+    assert result["users"][0]["display_name"] == "Adilet Sataev"
+    assert result["errors"] == []
+
+
+def test_list_issue_types(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.list_issue_types)("BL", None))
+    by_name = {t["name"]: t for t in result["issue_types"]}
+    assert "Dev SubTask" in by_name and "Dev Task" in by_name
+    assert by_name["Dev SubTask"]["subtask"] is True
+    assert by_name["Dev Task"]["subtask"] is False
+
+
+def test_get_create_metadata_required_fields(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.get_create_metadata)("BL", "Dev SubTask", None))
+    assert {f["id"] for f in result["required_fields"]} == {"summary", "parent"}
+
+
+def test_get_create_metadata_unknown_type_raises(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="not found"):
+        asyncio.run(_fn(server.get_create_metadata)("BL", "Nope", None))

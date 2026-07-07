@@ -37,7 +37,9 @@ mcp = FastMCP(
         "- Sub-tasks cannot nest: create with a sub-task issue type and fields.parent under a "
         "standard (non-sub-task) issue.\n"
         "- Assignee: Data Center uses fields.assignee.name (username, often the email); Cloud "
-        "uses accountId.\n"
+        "uses accountId. whoami returns your identity per profile.\n"
+        "- Before create_issue on an unfamiliar project, use list_issue_types and "
+        "get_create_metadata to pick a valid type and satisfy required fields.\n"
         "- delete_comment is irreversible; create_issue has no delete (cancel instead); "
         "notify_users=false needs Jira admin rights."
     ),
@@ -425,6 +427,109 @@ async def my_issues(
     # Global sort so the merge across profiles is truly ordered, not just grouped.
     issues.sort(key=lambda issue: issue.get("updated") or "", reverse=True)
     return {"count": len(issues), "jql": jql, "issues": issues, "errors": errors}
+
+
+@mcp.tool()
+async def whoami(ctx: Context) -> dict[str, Any]:
+    """Identify the current user on each configured Jira profile (read-only).
+
+    Useful for assignee values: Data Center uses `name` (the username, often the email),
+    Cloud uses `account_id`. Nothing is modified.
+    """
+    del ctx
+    try:
+        profiles = load_jira_profiles()
+    except ConfigError as exc:
+        raise _translate_error(exc) from exc
+
+    users: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for profile in profiles:
+        try:
+            adapter = build_jira_adapter(profile)
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+            continue
+        try:
+            me = await adapter.get_myself()
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+            me = None
+        finally:
+            await adapter.aclose()
+        if me:
+            users.append(
+                {
+                    "profile": profile.resolved_name,
+                    "name": me.get("name"),
+                    "account_id": me.get("accountId"),
+                    "display_name": me.get("displayName"),
+                    "email": me.get("emailAddress"),
+                }
+            )
+    return {"users": users, "errors": errors}
+
+
+@mcp.tool()
+async def list_issue_types(project_or_prefix: str, ctx: Context) -> dict[str, Any]:
+    """List the issue types available for creating issues in a project (read-only).
+
+    Use before create_issue to pick a valid `issue_type` (and see which are sub-tasks).
+    """
+    del ctx
+    try:
+        project_key = project_or_prefix.strip().upper()
+        profile = resolve_profile_for_issue_key(project_key)
+        adapter = build_jira_adapter(profile)
+        try:
+            meta = await adapter.get_create_meta(project_key, expand="projects.issuetypes")
+        finally:
+            await adapter.aclose()
+        types = [
+            {"id": it.get("id"), "name": it.get("name"), "subtask": it.get("subtask", False)}
+            for proj in meta.get("projects", [])
+            for it in proj.get("issuetypes", [])
+        ]
+        return {"project": project_key, "issue_types": types}
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def get_create_metadata(project_or_prefix: str, issue_type: str, ctx: Context) -> dict[str, Any]:
+    """List the fields (and which are required) for creating an issue of a given type (read-only).
+
+    Use before create_issue to satisfy mandatory fields. `issue_type` may be its name
+    (case-insensitive) or id.
+    """
+    del ctx
+    try:
+        project_key = project_or_prefix.strip().upper()
+        wanted = issue_type.strip().lower()
+        profile = resolve_profile_for_issue_key(project_key)
+        adapter = build_jira_adapter(profile)
+        try:
+            meta = await adapter.get_create_meta(project_key, expand="projects.issuetypes.fields")
+        finally:
+            await adapter.aclose()
+        all_fields: list[dict[str, Any]] | None = None
+        for proj in meta.get("projects", []):
+            for it in proj.get("issuetypes", []):
+                if str(it.get("name", "")).strip().lower() == wanted or str(it.get("id")) == issue_type.strip():
+                    all_fields = [
+                        {"id": fid, "name": spec.get("name"), "required": spec.get("required", False)}
+                        for fid, spec in it.get("fields", {}).items()
+                    ]
+        if all_fields is None:
+            raise ValueError(f"Issue type '{issue_type}' not found for project {project_key}.")
+        return {
+            "project": project_key,
+            "issue_type": issue_type,
+            "required_fields": [f for f in all_fields if f["required"]],
+            "all_fields": all_fields,
+        }
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
 
 
 def main() -> None:

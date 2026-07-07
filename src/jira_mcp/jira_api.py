@@ -27,6 +27,12 @@ class JiraAdapter(Protocol):
         self, jql: str, *, fields: Sequence[str], max_results: int = 50, start_at: int = 0
     ) -> dict[str, Any]: ...
 
+    async def get_myself(self) -> dict[str, Any]: ...
+
+    async def get_create_meta(
+        self, project_key: str, *, expand: str | None = None
+    ) -> dict[str, Any]: ...
+
     async def update_issue(
         self,
         issue_key: str,
@@ -148,6 +154,17 @@ class BaseJiraApiClient:
                 "startAt": start_at,
             },
         )
+
+    async def get_myself(self) -> dict[str, Any]:
+        return await self._request("GET", "/myself")
+
+    async def get_create_meta(
+        self, project_key: str, *, expand: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"projectKeys": project_key}
+        if expand:
+            params["expand"] = expand
+        return await self._request("GET", "/issue/createmeta", params=params)
 
     async def update_issue(
         self,

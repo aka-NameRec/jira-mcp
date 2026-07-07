@@ -17,6 +17,9 @@ Read-only:
 - `get_issue_for_review` — compact issue + comments + attachments + linked work.
 - `list_transitions` — workflow transitions available from the issue's current status.
 - `my_issues` — issues assigned to the current user across all configured profiles.
+- `whoami` — the current user per profile (use for assignee identity).
+- `list_issue_types` — issue types available for creating issues in a project.
+- `get_create_metadata` — fields (and which are required) for creating a given issue type.
 
 Write (mutate real Jira — use with explicit intent):
 - `update_issue` — set fields; `add` / `remove` change multi-value fields via Jira's update verb without clobbering.
