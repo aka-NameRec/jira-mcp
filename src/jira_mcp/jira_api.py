@@ -22,6 +22,10 @@ class JiraAdapter(Protocol):
 
     async def get_transitions(self, issue_key: str) -> dict[str, Any]: ...
 
+    async def search_issues(
+        self, jql: str, *, fields: list[str], max_results: int = 50, start_at: int = 0
+    ) -> dict[str, Any]: ...
+
     async def update_issue(
         self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True
     ) -> None: ...
@@ -113,6 +117,20 @@ class BaseJiraApiClient:
     async def get_transitions(self, issue_key: str) -> dict[str, Any]:
         return await self._request(
             "GET", f"/issue/{issue_key}/transitions", params={"expand": "transitions.fields"}
+        )
+
+    async def search_issues(
+        self, jql: str, *, fields: list[str], max_results: int = 50, start_at: int = 0
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/search",
+            params={
+                "jql": jql,
+                "fields": ",".join(fields),
+                "maxResults": max_results,
+                "startAt": start_at,
+            },
         )
 
     async def update_issue(

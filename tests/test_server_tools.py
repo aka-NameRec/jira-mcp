@@ -40,6 +40,24 @@ class FakeAdapter:
         self.calls.append(("create", fields))
         return {"id": "9", "key": "BL-9"}
 
+    async def search_issues(self, jql: str, *, fields, max_results: int = 50, start_at: int = 0) -> dict[str, Any]:
+        self.calls.append(("search", jql, max_results))
+        return {
+            "issues": [
+                {
+                    "key": "BL-1",
+                    "fields": {
+                        "summary": "S",
+                        "status": {"name": "В работе"},
+                        "issuetype": {"name": "Dev SubTask"},
+                        "priority": {"name": "Low"},
+                        "project": {"key": "BL"},
+                        "updated": "2026-07-08T00:00:00.000+0000",
+                    },
+                }
+            ]
+        }
+
 
 def _fn(tool: Any):
     """Return the underlying coroutine function whether mcp.tool() returns it raw or wrapped."""
@@ -58,6 +76,7 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeAdapter:
     monkeypatch.setattr(server, "resolve_profile_for_issue_key", lambda key: profile)
     monkeypatch.setattr(server, "resolve_profile_for_url", lambda url: profile)
     monkeypatch.setattr(server, "build_jira_adapter", lambda prof: adapter)
+    monkeypatch.setattr(server, "load_jira_profiles", lambda: [profile])
     return adapter
 
 
@@ -100,3 +119,24 @@ def test_create_issue_builds_payload_with_alias(fake: FakeAdapter) -> None:
     assert payload["description"] == "desc"
     assert payload["customfield_5"] == "AC"
     assert result["issue_key"] == "BL-9"
+
+
+def test_my_issues_default_jql_and_shape(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.my_issues)(None))
+    jql = fake.calls[0][1]
+    assert fake.calls[0][0] == "search"
+    assert "assignee = currentUser()" in jql
+    assert "statusCategory != Done" in jql  # only_open defaults to True
+    assert result["count"] == 1
+    issue = result["issues"][0]
+    assert issue["key"] == "BL-1"
+    assert issue["project"] == "BL"
+    assert issue["status"] == "В работе"
+    assert issue["url"].endswith("/browse/BL-1")
+
+
+def test_my_issues_all_and_project_filter(fake: FakeAdapter) -> None:
+    asyncio.run(_fn(server.my_issues)(None, only_open=False, project="mkt"))
+    jql = fake.calls[0][1]
+    assert "statusCategory != Done" not in jql  # only_open=False drops the filter
+    assert "project = MKT" in jql

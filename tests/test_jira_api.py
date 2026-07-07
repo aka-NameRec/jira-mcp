@@ -169,6 +169,27 @@ def test_create_issue_posts_fields() -> None:
     assert result["key"] == "BL-2"
 
 
+def test_search_issues_reads_with_params() -> None:
+    seen, handler = _capture(200, json_body={"issues": [], "total": 0})
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler)
+        try:
+            return await adapter.search_issues(
+                "assignee = currentUser()", fields=["summary", "status"], max_results=25
+            )
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/api/2/search")
+    assert seen["params"]["jql"] == "assignee = currentUser()"
+    assert seen["params"]["fields"] == "summary,status"
+    assert seen["params"]["maxResults"] == "25"
+    assert result["total"] == 0
+
+
 def test_non_2xx_raises_jira_api_error() -> None:
     _, handler = _capture(400, text="Field 'summary' is required")
 

@@ -7,6 +7,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from .config import (
     ConfigError,
     JiraProfile,
+    load_jira_profiles,
     resolve_profile_for_issue_key,
     resolve_profile_for_url,
 )
@@ -280,6 +281,59 @@ async def list_transitions(issue_key_or_url: str, ctx: Context) -> dict[str, Any
             }
         finally:
             await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+_MY_ISSUES_FIELDS = ["summary", "status", "issuetype", "priority", "project", "updated"]
+
+
+@mcp.tool()
+async def my_issues(
+    ctx: Context,
+    only_open: bool = True,
+    project: str | None = None,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List Jira issues assigned to the current user, across every configured project (read-only).
+
+    Runs `assignee = currentUser()` on each configured Jira profile and merges the results.
+    Set only_open=False to include done/closed issues, or pass a project key (e.g. "BL",
+    "MKT", "DEVOPS") to narrow to one project. Nothing is modified.
+    """
+    del ctx
+    clauses = ["assignee = currentUser()"]
+    if only_open:
+        clauses.append("statusCategory != Done")
+    if project:
+        clauses.append(f"project = {project.strip().upper()}")
+    jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+
+    try:
+        issues: list[dict[str, Any]] = []
+        for profile in load_jira_profiles():
+            adapter = build_jira_adapter(profile)
+            try:
+                data = await adapter.search_issues(
+                    jql, fields=_MY_ISSUES_FIELDS, max_results=max_results
+                )
+            finally:
+                await adapter.aclose()
+            for item in data.get("issues", []):
+                fields = item.get("fields", {})
+                issues.append(
+                    {
+                        "key": item.get("key"),
+                        "summary": fields.get("summary"),
+                        "status": (fields.get("status") or {}).get("name"),
+                        "type": (fields.get("issuetype") or {}).get("name"),
+                        "priority": (fields.get("priority") or {}).get("name"),
+                        "project": (fields.get("project") or {}).get("key"),
+                        "updated": fields.get("updated"),
+                        "url": f"{profile.normalized_base_url}/browse/{item.get('key')}",
+                    }
+                )
+        return {"count": len(issues), "jql": jql, "issues": issues}
     except (ConfigError, JiraApiError) as exc:
         raise _translate_error(exc) from exc
 
