@@ -252,5 +252,37 @@ async def create_issue(
         raise _translate_error(exc) from exc
 
 
+@mcp.tool()
+async def list_transitions(issue_key_or_url: str, ctx: Context) -> dict[str, Any]:
+    """List the workflow transitions available for a Jira issue right now (read-only).
+
+    Transitions are state- and permission-dependent, so this returns only the moves valid
+    from the issue's current status. Use a returned id or name as the `transition` argument
+    of transition_issue. Nothing is modified.
+    """
+    del ctx
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            data = await adapter.get_transitions(issue_key)
+            transitions = [
+                {
+                    "id": str(item.get("id")),
+                    "name": item.get("name"),
+                    "to_status": (item.get("to") or {}).get("name"),
+                }
+                for item in data.get("transitions", [])
+            ]
+            return {
+                "issue_key": issue_key,
+                "transitions": transitions,
+                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
 def main() -> None:
     mcp.run()

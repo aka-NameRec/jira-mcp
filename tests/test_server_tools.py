@@ -81,6 +81,13 @@ def test_transition_issue_resolves_name(fake: FakeAdapter) -> None:
     assert result["transition_id"] == "31"
 
 
+def test_list_transitions_shapes_result(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.list_transitions)("BL-1", None))
+    assert result["issue_key"] == "BL-1"
+    assert result["transitions"] == [{"id": "31", "name": "Done", "to_status": None}]
+    assert result["url"].endswith("/browse/BL-1")
+
+
 def test_create_issue_builds_payload_with_alias(fake: FakeAdapter) -> None:
     result = asyncio.run(
         _fn(server.create_issue)("bl", "Task", "Summary", None, "desc", {"acceptance_criteria": "AC"})
