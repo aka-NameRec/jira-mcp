@@ -114,6 +114,12 @@ def test_update_issue_requires_something_to_change(fake: FakeAdapter) -> None:
     assert fake.calls == []
 
 
+def test_update_issue_add_scalar_is_normalized(fake: FakeAdapter) -> None:
+    # A scalar (not a list) must not be iterated char-by-char.
+    asyncio.run(_fn(server.update_issue)("BL-1", None, None, {"labels": "china"}))
+    assert fake.calls == [("update", "BL-1", None, {"labels": [{"add": "china"}]}, True)]
+
+
 def test_add_comment_returns_comment_id(fake: FakeAdapter) -> None:
     result = asyncio.run(_fn(server.add_comment)("BL-1", "hi", None))
     assert fake.calls == [("comment", "BL-1", "hi")]
@@ -173,3 +179,44 @@ def test_my_issues_all_and_project_filter(fake: FakeAdapter) -> None:
     jql = fake.calls[0][1]
     assert "statusCategory != Done" not in jql  # only_open=False drops the filter
     assert "project = MKT" in jql
+
+
+def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jira_mcp.jira_api import JiraApiError
+
+    p_ok = JiraProfile(base_url="https://a.test", token="t", issue_key_prefixes=["A"])
+    p_bad = JiraProfile(base_url="https://b.test", token="t", issue_key_prefixes=["B"])
+
+    class Ok:
+        def __init__(self, profile: JiraProfile) -> None:
+            self.profile = profile
+
+        async def aclose(self) -> None:
+            return None
+
+        async def search_issues(self, jql, *, fields, max_results=50, start_at=0):
+            return {
+                "issues": [
+                    {"key": "A-1", "fields": {"project": {"key": "A"}, "updated": "2026-01-01"}},
+                    {"key": "A-2", "fields": {"project": {"key": "A"}, "updated": "2026-03-01"}},
+                ]
+            }
+
+    class Bad:
+        def __init__(self, profile: JiraProfile) -> None:
+            self.profile = profile
+
+        async def aclose(self) -> None:
+            return None
+
+        async def search_issues(self, *a, **k):
+            raise JiraApiError("boom")
+
+    adapters = {p_ok.normalized_base_url: Ok(p_ok), p_bad.normalized_base_url: Bad(p_bad)}
+    monkeypatch.setattr(server, "load_jira_profiles", lambda: [p_ok, p_bad])
+    monkeypatch.setattr(server, "build_jira_adapter", lambda prof: adapters[prof.normalized_base_url])
+
+    result = asyncio.run(_fn(server.my_issues)(None))
+    assert [i["key"] for i in result["issues"]] == ["A-2", "A-1"]  # global sort by updated desc
+    assert len(result["errors"]) == 1  # bad profile isolated, not fatal
+    assert result["errors"][0]["profile"] == p_bad.resolved_name

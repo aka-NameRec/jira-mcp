@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from typing import Any, Protocol
 from urllib.parse import urljoin
 
@@ -23,7 +24,7 @@ class JiraAdapter(Protocol):
     async def get_transitions(self, issue_key: str) -> dict[str, Any]: ...
 
     async def search_issues(
-        self, jql: str, *, fields: list[str], max_results: int = 50, start_at: int = 0
+        self, jql: str, *, fields: Sequence[str], max_results: int = 50, start_at: int = 0
     ) -> dict[str, Any]: ...
 
     async def update_issue(
@@ -97,14 +98,15 @@ class BaseJiraApiClient:
         response = await self._send(method, path, **kwargs)
         return response.json()
 
-    def _adf_doc(self, text: str) -> dict[str, Any]:
+    @staticmethod
+    def _adf_doc(text: str) -> dict[str, Any]:
         return {
             "type": "doc",
             "version": 1,
             "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
         }
 
-    def _comment_body(self, text: str) -> Any:
+    def _comment_body(self, text: str) -> str | dict[str, Any]:
         # DC / API v2 accepts a plain string; Cloud / API v3 needs an ADF document.
         return self._adf_doc(text) if self.api_version == "3" else text
 
@@ -136,7 +138,7 @@ class BaseJiraApiClient:
         )
 
     async def search_issues(
-        self, jql: str, *, fields: list[str], max_results: int = 50, start_at: int = 0
+        self, jql: str, *, fields: Sequence[str], max_results: int = 50, start_at: int = 0
     ) -> dict[str, Any]:
         return await self._request(
             "GET",

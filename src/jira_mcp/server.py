@@ -83,16 +83,25 @@ def _resolve_transition_id(transition: str, available: list[dict[str, Any]]) -> 
     raise ValueError(f"No transition matching '{transition}'. Available: {names}.")
 
 
+def _as_list(values: Any) -> list[Any]:
+    """A single value or a list -> list; guards against iterating a string char-by-char."""
+    return values if isinstance(values, list) else [values]
+
+
 def _build_update_ops(
     add: dict[str, Any] | None, remove: dict[str, Any] | None
 ) -> dict[str, list[dict[str, Any]]]:
     """Translate add/remove field maps into Jira `update` verb operations (no clobber)."""
     ops: dict[str, list[dict[str, Any]]] = {}
     for field, values in (add or {}).items():
-        ops.setdefault(field, []).extend({"add": value} for value in values)
+        ops.setdefault(field, []).extend({"add": value} for value in _as_list(values))
     for field, values in (remove or {}).items():
-        ops.setdefault(field, []).extend({"remove": value} for value in values)
+        ops.setdefault(field, []).extend({"remove": value} for value in _as_list(values))
     return ops
+
+
+def _browse_url(profile: JiraProfile, issue_key: str | None) -> str:
+    return f"{profile.normalized_base_url}/browse/{issue_key}"
 
 
 @mcp.tool()
@@ -175,7 +184,7 @@ async def update_issue(
                 "issue_key": issue_key,
                 "status": "updated",
                 "updated_fields": changed,
-                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+                "url": _browse_url(profile, issue_key),
             }
         finally:
             await adapter.aclose()
@@ -195,7 +204,7 @@ async def add_comment(issue_key_or_url: str, body: str, ctx: Context) -> dict[st
                 "issue_key": issue_key,
                 "status": "commented",
                 "comment_id": created.get("id"),
-                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+                "url": _browse_url(profile, issue_key),
             }
         finally:
             await adapter.aclose()
@@ -219,7 +228,7 @@ async def delete_comment(issue_key_or_url: str, comment_id: str, ctx: Context) -
                 "issue_key": issue_key,
                 "status": "comment_deleted",
                 "comment_id": str(comment_id),
-                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+                "url": _browse_url(profile, issue_key),
             }
         finally:
             await adapter.aclose()
@@ -251,7 +260,7 @@ async def transition_issue(
                 "issue_key": issue_key,
                 "status": "transitioned",
                 "transition_id": transition_id,
-                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+                "url": _browse_url(profile, issue_key),
             }
         finally:
             await adapter.aclose()
@@ -294,7 +303,7 @@ async def create_issue(
             return {
                 "issue_key": key,
                 "status": "created",
-                "url": f"{profile.normalized_base_url}/browse/{key}" if key else None,
+                "url": _browse_url(profile, key) if key else None,
             }
         finally:
             await adapter.aclose()
@@ -326,7 +335,7 @@ async def list_transitions(issue_key_or_url: str, ctx: Context) -> dict[str, Any
             return {
                 "issue_key": issue_key,
                 "transitions": transitions,
-                "url": f"{profile.normalized_base_url}/browse/{issue_key}",
+                "url": _browse_url(profile, issue_key),
             }
         finally:
             await adapter.aclose()
@@ -359,32 +368,42 @@ async def my_issues(
     jql = " AND ".join(clauses) + " ORDER BY updated DESC"
 
     try:
-        issues: list[dict[str, Any]] = []
-        for profile in load_jira_profiles():
-            adapter = build_jira_adapter(profile)
-            try:
-                data = await adapter.search_issues(
-                    jql, fields=_MY_ISSUES_FIELDS, max_results=max_results
-                )
-            finally:
-                await adapter.aclose()
-            for item in data.get("issues", []):
-                fields = item.get("fields", {})
-                issues.append(
-                    {
-                        "key": item.get("key"),
-                        "summary": fields.get("summary"),
-                        "status": (fields.get("status") or {}).get("name"),
-                        "type": (fields.get("issuetype") or {}).get("name"),
-                        "priority": (fields.get("priority") or {}).get("name"),
-                        "project": (fields.get("project") or {}).get("key"),
-                        "updated": fields.get("updated"),
-                        "url": f"{profile.normalized_base_url}/browse/{item.get('key')}",
-                    }
-                )
-        return {"count": len(issues), "jql": jql, "issues": issues}
-    except (ConfigError, JiraApiError) as exc:
+        profiles = load_jira_profiles()
+    except ConfigError as exc:
         raise _translate_error(exc) from exc
+
+    issues: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for profile in profiles:
+        try:
+            adapter = build_jira_adapter(profile)
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+            continue
+        try:
+            data = await adapter.search_issues(jql, fields=_MY_ISSUES_FIELDS, max_results=max_results)
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+            data = None
+        finally:
+            await adapter.aclose()
+        for item in (data or {}).get("issues", []):
+            fields = item.get("fields", {})
+            issues.append(
+                {
+                    "key": item.get("key"),
+                    "summary": fields.get("summary"),
+                    "status": (fields.get("status") or {}).get("name"),
+                    "type": (fields.get("issuetype") or {}).get("name"),
+                    "priority": (fields.get("priority") or {}).get("name"),
+                    "project": (fields.get("project") or {}).get("key"),
+                    "updated": fields.get("updated"),
+                    "url": _browse_url(profile, item.get("key")),
+                }
+            )
+    # Global sort so the merge across profiles is truly ordered, not just grouped.
+    issues.sort(key=lambda issue: issue.get("updated") or "", reverse=True)
+    return {"count": len(issues), "jql": jql, "issues": issues, "errors": errors}
 
 
 def main() -> None:
