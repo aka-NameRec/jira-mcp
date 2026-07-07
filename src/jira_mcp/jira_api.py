@@ -27,7 +27,12 @@ class JiraAdapter(Protocol):
     ) -> dict[str, Any]: ...
 
     async def update_issue(
-        self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True
+        self,
+        issue_key: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        update: dict[str, Any] | None = None,
+        notify_users: bool = True,
     ) -> None: ...
 
     async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]: ...
@@ -90,15 +95,24 @@ class BaseJiraApiClient:
         response = await self._send(method, path, **kwargs)
         return response.json()
 
+    def _adf_doc(self, text: str) -> dict[str, Any]:
+        return {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+        }
+
     def _comment_body(self, text: str) -> Any:
-        # Data Center / API v2 accepts a plain string; Cloud / API v3 needs an ADF document.
-        if self.api_version == "3":
-            return {
-                "type": "doc",
-                "version": 1,
-                "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
-            }
-        return text
+        # DC / API v2 accepts a plain string; Cloud / API v3 needs an ADF document.
+        return self._adf_doc(text) if self.api_version == "3" else text
+
+    def _prepare_fields(self, fields: dict[str, Any] | None) -> dict[str, Any] | None:
+        # On Cloud / API v3 the rich-text `description` must be ADF, not a plain string.
+        if not fields or self.api_version != "3":
+            return fields
+        if isinstance(fields.get("description"), str):
+            return {**fields, "description": self._adf_doc(fields["description"])}
+        return fields
 
     async def get_issue(self, issue_key: str) -> dict[str, Any]:
         return await self._request(
@@ -134,14 +148,26 @@ class BaseJiraApiClient:
         )
 
     async def update_issue(
-        self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True
+        self,
+        issue_key: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        update: dict[str, Any] | None = None,
+        notify_users: bool = True,
     ) -> None:
-        # PUT returns 204 No Content on success.
+        # PUT returns 204 No Content on success. `fields` sets values; `update` applies
+        # add/remove verbs so multi-value fields are not clobbered.
+        body: dict[str, Any] = {}
+        prepared = self._prepare_fields(fields)
+        if prepared:
+            body["fields"] = prepared
+        if update:
+            body["update"] = update
         await self._send(
             "PUT",
             f"/issue/{issue_key}",
             params={"notifyUsers": "true" if notify_users else "false"},
-            json={"fields": fields},
+            json=body,
         )
 
     async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
@@ -159,7 +185,7 @@ class BaseJiraApiClient:
         await self._send("POST", f"/issue/{issue_key}/transitions", json=payload)
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/issue", json={"fields": fields})
+        return await self._request("POST", "/issue", json={"fields": self._prepare_fields(fields)})
 
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None:
         if not maybe_relative_url:

@@ -82,6 +82,18 @@ def _resolve_transition_id(transition: str, available: list[dict[str, Any]]) -> 
     raise ValueError(f"No transition matching '{transition}'. Available: {names}.")
 
 
+def _build_update_ops(
+    add: dict[str, Any] | None, remove: dict[str, Any] | None
+) -> dict[str, list[dict[str, Any]]]:
+    """Translate add/remove field maps into Jira `update` verb operations (no clobber)."""
+    ops: dict[str, list[dict[str, Any]]] = {}
+    for field, values in (add or {}).items():
+        ops.setdefault(field, []).extend({"add": value} for value in values)
+    for field, values in (remove or {}).items():
+        ops.setdefault(field, []).extend({"remove": value} for value in values)
+    return ops
+
+
 @mcp.tool()
 async def parse_issue_url(url: str, ctx: Context) -> dict[str, Any]:
     """Parse a Jira issue URL into a stable issue reference."""
@@ -130,26 +142,38 @@ async def get_issue_for_review(issue_key_or_url: str, ctx: Context) -> dict[str,
 @mcp.tool()
 async def update_issue(
     issue_key_or_url: str,
-    fields: dict[str, Any],
     ctx: Context,
+    fields: dict[str, Any] | None = None,
+    add: dict[str, Any] | None = None,
+    remove: dict[str, Any] | None = None,
     notify_users: bool = True,
 ) -> dict[str, Any]:
-    """Update fields of an existing Jira issue.
+    """Update a Jira issue.
 
-    `fields` maps Jira field ids to values, e.g. {"summary": "...", "labels": ["china"],
-    "description": "..."}. The semantic aliases 'acceptance_criteria', 'business_context',
-    and 'design_links' are translated to the profile's configured customfield ids.
+    `fields` SETS values and REPLACES multi-value fields — e.g. {"summary": "..."} or
+    {"description": "..."}; semantic aliases 'acceptance_criteria' / 'business_context' /
+    'design_links' map to the profile's customfield ids.
+
+    To change multi-value fields (labels, components, ...) WITHOUT clobbering existing
+    values, use `add` / `remove`: a mapping of field id -> list of values applied via Jira's
+    update verb, e.g. add={"labels": ["china"]}, remove={"labels": ["old"]}.
     """
     del ctx
+    if not fields and not add and not remove:
+        raise ValueError("update_issue needs at least one of: fields, add, remove.")
     try:
         profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
         try:
-            translated = _translate_fields(fields, build_field_mapping(profile))
-            await adapter.update_issue(issue_key, translated, notify_users=notify_users)
+            translated = _translate_fields(fields, build_field_mapping(profile)) if fields else None
+            update_ops = _build_update_ops(add, remove)
+            await adapter.update_issue(
+                issue_key, translated, update=update_ops or None, notify_users=notify_users
+            )
+            changed = sorted(set((translated or {}).keys()) | set(update_ops.keys()))
             return {
                 "issue_key": issue_key,
                 "status": "updated",
-                "updated_fields": sorted(translated.keys()),
+                "updated_fields": changed,
                 "url": f"{profile.normalized_base_url}/browse/{issue_key}",
             }
         finally:

@@ -23,8 +23,15 @@ class FakeAdapter:
     async def aclose(self) -> None:
         return None
 
-    async def update_issue(self, issue_key: str, fields: dict[str, Any], *, notify_users: bool = True) -> None:
-        self.calls.append(("update", issue_key, fields, notify_users))
+    async def update_issue(
+        self,
+        issue_key: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        update: dict[str, Any] | None = None,
+        notify_users: bool = True,
+    ) -> None:
+        self.calls.append(("update", issue_key, fields, update, notify_users))
 
     async def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
         self.calls.append(("comment", issue_key, body))
@@ -81,11 +88,27 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeAdapter:
 
 
 def test_update_issue_translates_alias(fake: FakeAdapter) -> None:
-    result = asyncio.run(_fn(server.update_issue)("BL-1", {"acceptance_criteria": "AC"}, None))
-    assert fake.calls == [("update", "BL-1", {"customfield_5": "AC"}, True)]
+    result = asyncio.run(_fn(server.update_issue)("BL-1", None, {"acceptance_criteria": "AC"}))
+    assert fake.calls == [("update", "BL-1", {"customfield_5": "AC"}, None, True)]
     assert result["status"] == "updated"
     assert result["updated_fields"] == ["customfield_5"]
     assert result["url"].endswith("/browse/BL-1")
+
+
+def test_update_issue_add_remove_uses_update_verb(fake: FakeAdapter) -> None:
+    result = asyncio.run(
+        _fn(server.update_issue)("BL-1", None, None, {"labels": ["china"]}, {"labels": ["old"]})
+    )
+    assert fake.calls == [
+        ("update", "BL-1", None, {"labels": [{"add": "china"}, {"remove": "old"}]}, True)
+    ]
+    assert result["updated_fields"] == ["labels"]
+
+
+def test_update_issue_requires_something_to_change(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="at least one of"):
+        asyncio.run(_fn(server.update_issue)("BL-1", None))
+    assert fake.calls == []
 
 
 def test_add_comment_returns_comment_id(fake: FakeAdapter) -> None:

@@ -70,6 +70,51 @@ def test_update_issue_puts_fields_with_notify_param() -> None:
     assert result is None  # 204 No Content, no body parsed
 
 
+def test_update_issue_update_verb_only() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.update_issue("BL-1", None, update={"labels": [{"add": "x"}]})
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "PUT"
+    assert seen["body"] == {"update": {"labels": [{"add": "x"}]}}
+
+
+def test_update_issue_wraps_description_adf_on_cloud() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="cloud")
+        try:
+            await adapter.update_issue("BL-1", {"description": "hi"})
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    body = seen["body"]["fields"]["description"]
+    assert body["type"] == "doc"
+    assert body["content"][0]["content"][0]["text"] == "hi"
+
+
+def test_create_issue_wraps_description_adf_on_cloud() -> None:
+    seen, handler = _capture(201, json_body={"key": "BL-2"})
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler, deployment="cloud")
+        try:
+            return await adapter.create_issue({"summary": "s", "description": "hi"})
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["body"]["fields"]["description"]["type"] == "doc"
+
+
 def test_add_comment_plain_body_for_dc() -> None:
     seen, handler = _capture(201, json_body={"id": "999"})
 
