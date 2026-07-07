@@ -43,8 +43,8 @@ class FakeAdapter:
     async def get_transitions(self, issue_key: str) -> dict[str, Any]:
         return {"transitions": [{"id": "31", "name": "Done"}]}
 
-    async def transition_issue(self, issue_key: str, transition_id: str, *, comment: str | None = None) -> None:
-        self.calls.append(("transition", issue_key, transition_id, comment))
+    async def transition_issue(self, issue_key: str, transition_id: str) -> None:
+        self.calls.append(("transition", issue_key, transition_id))
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("create", fields))
@@ -133,10 +133,18 @@ def test_delete_comment_tool(fake: FakeAdapter) -> None:
     assert result["comment_id"] == "555"
 
 
-def test_transition_issue_resolves_name(fake: FakeAdapter) -> None:
+def test_transition_issue_resolves_name_and_comments_separately(fake: FakeAdapter) -> None:
     result = asyncio.run(_fn(server.transition_issue)("BL-1", "done", None, "note"))
-    assert fake.calls == [("transition", "BL-1", "31", "note")]
+    # Transition first, then a separate add_comment (not embedded in the transition payload).
+    assert fake.calls == [("transition", "BL-1", "31"), ("comment", "BL-1", "note")]
     assert result["transition_id"] == "31"
+    assert result["commented"] is True
+
+
+def test_transition_issue_without_comment_skips_add_comment(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.transition_issue)("BL-1", "31", None))
+    assert fake.calls == [("transition", "BL-1", "31")]
+    assert result["commented"] is False
 
 
 def test_list_transitions_shapes_result(fake: FakeAdapter) -> None:

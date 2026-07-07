@@ -40,9 +40,7 @@ class JiraAdapter(Protocol):
 
     async def delete_comment(self, issue_key: str, comment_id: str) -> None: ...
 
-    async def transition_issue(
-        self, issue_key: str, transition_id: str, *, comment: str | None = None
-    ) -> None: ...
+    async def transition_issue(self, issue_key: str, transition_id: str) -> None: ...
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -183,14 +181,15 @@ class BaseJiraApiClient:
         # DELETE returns 204 No Content on success.
         await self._send("DELETE", f"/issue/{issue_key}/comment/{comment_id}")
 
-    async def transition_issue(
-        self, issue_key: str, transition_id: str, *, comment: str | None = None
-    ) -> None:
-        # POST returns 204 No Content on success.
-        payload: dict[str, Any] = {"transition": {"id": str(transition_id)}}
-        if comment:
-            payload["update"] = {"comment": [{"add": {"body": self._comment_body(comment)}}]}
-        await self._send("POST", f"/issue/{issue_key}/transitions", json=payload)
+    async def transition_issue(self, issue_key: str, transition_id: str) -> None:
+        # POST returns 204 No Content on success. A comment is NOT attached here: many
+        # transition screens have no comment field and would silently drop it — post the
+        # comment separately via add_comment instead.
+        await self._send(
+            "POST",
+            f"/issue/{issue_key}/transitions",
+            json={"transition": {"id": str(transition_id)}},
+        )
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/issue", json={"fields": self._prepare_fields(fields)})

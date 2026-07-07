@@ -164,24 +164,7 @@ def test_delete_comment_issues_delete() -> None:
     assert seen["path"].endswith("/rest/api/2/issue/BL-1/comment/555")
 
 
-def test_transition_issue_posts_transition_and_comment() -> None:
-    seen, handler = _capture(204)
-
-    async def scenario() -> None:
-        adapter = await _make_adapter(handler)
-        try:
-            await adapter.transition_issue("BL-1", "31", comment="done")
-        finally:
-            await adapter.aclose()
-
-    asyncio.run(scenario())
-    assert seen["method"] == "POST"
-    assert seen["path"].endswith("/rest/api/2/issue/BL-1/transitions")
-    assert seen["body"]["transition"] == {"id": "31"}
-    assert seen["body"]["update"]["comment"][0]["add"]["body"] == "done"
-
-
-def test_transition_issue_without_comment_omits_update() -> None:
+def test_transition_issue_posts_transition_only() -> None:
     seen, handler = _capture(204)
 
     async def scenario() -> None:
@@ -192,6 +175,9 @@ def test_transition_issue_without_comment_omits_update() -> None:
             await adapter.aclose()
 
     asyncio.run(scenario())
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/transitions")
+    # No comment embedded in the transition payload (posted separately by the tool).
     assert seen["body"] == {"transition": {"id": "5"}}
 
 

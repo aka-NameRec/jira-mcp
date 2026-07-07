@@ -255,11 +255,18 @@ async def transition_issue(
         try:
             available = (await adapter.get_transitions(issue_key)).get("transitions", [])
             transition_id = _resolve_transition_id(transition, available)
-            await adapter.transition_issue(issue_key, transition_id, comment=comment)
+            await adapter.transition_issue(issue_key, transition_id)
+            # Post the comment separately: a transition screen without a comment field
+            # would otherwise drop it silently.
+            commented = False
+            if comment:
+                await adapter.add_comment(issue_key, comment)
+                commented = True
             return {
                 "issue_key": issue_key,
                 "status": "transitioned",
                 "transition_id": transition_id,
+                "commented": commented,
                 "url": _browse_url(profile, issue_key),
             }
         finally:
