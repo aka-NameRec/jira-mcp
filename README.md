@@ -36,7 +36,8 @@ Write tools change real Jira issues. Use them only with explicit user intent and
 - **Irreversibility.** `delete_comment` is permanent; `create_issue` has no delete (cancel instead).
 - **`notify_users=false`** requires Jira admin rights (403 otherwise) — leave the default.
 - **Field aliases.** `update_issue` / `create_issue` accept `acceptance_criteria` / `business_context` / `design_links`, mapped to the profile's `field_mappings` customfield ids.
-- **Cloud caveat.** Live-tested on Data Center (API v2). On Cloud (v3), `my_issues` uses the deprecated `GET /search` and ADF wrapping covers `description` but not rich-text customfields.
+- **create_issue project vs profile.** `project_or_prefix` is used both as the literal project key and to select the profile via its configured `issue_key_prefixes`; it breaks if a project's key differs from its prefix.
+- **Cloud caveat.** Live-tested on Data Center (API v2). On Cloud (v3) these paths are DC-only until a Cloud branch is added: `my_issues` uses the deprecated `GET /search`; `list_issue_types` / `get_create_metadata` use the classic `GET /issue/createmeta` (removed on Cloud) and return empty there; ADF wrapping covers `description` but not rich-text customfields.
 
 ## Why This Exists
 

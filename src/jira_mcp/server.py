@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -13,7 +14,7 @@ from .config import (
 )
 from .field_mapping import FieldMapping, build_field_mapping
 from .issue_parser import parse_issue_url as parse_issue_url_parts
-from .jira_api import JiraApiError, build_jira_adapter
+from .jira_api import JiraAdapter, JiraApiError, build_jira_adapter
 from .models import IssueForReview, ParsedIssueRef
 from .normalizers import normalize_issue_for_review
 
@@ -55,15 +56,46 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
-async def _resolve_issue_context(issue_key_or_url: str) -> tuple[JiraProfile, Any, str]:
+async def _resolve_issue_context(issue_key_or_url: str) -> tuple[JiraProfile, JiraAdapter, str]:
     if _is_url(issue_key_or_url):
         profile = resolve_profile_for_url(issue_key_or_url)
         _, issue_key = parse_issue_url_parts(issue_key_or_url)
     else:
         issue_key = issue_key_or_url.strip().upper()
         profile = resolve_profile_for_issue_key(issue_key)
-    client = build_jira_adapter(profile)
-    return profile, client, issue_key
+    return profile, build_jira_adapter(profile), issue_key
+
+
+def _resolve_project_context(project_or_prefix: str) -> tuple[JiraProfile, JiraAdapter, str]:
+    """Resolve (profile, adapter, project_key) for create/discovery tools keyed by prefix."""
+    project_key = project_or_prefix.strip().upper()
+    profile = resolve_profile_for_issue_key(project_key)
+    return profile, build_jira_adapter(profile), project_key
+
+
+async def _collect_across_profiles(
+    work: Callable[[JiraProfile, JiraAdapter], Awaitable[Any]],
+) -> tuple[list[Any], list[dict[str, str]]]:
+    """Run `work` on every configured profile in isolation; return (results, per-profile errors)."""
+    try:
+        profiles = load_jira_profiles()
+    except ConfigError as exc:
+        raise _translate_error(exc) from exc
+    results: list[Any] = []
+    errors: list[dict[str, str]] = []
+    for profile in profiles:
+        try:
+            adapter = build_jira_adapter(profile)
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+            continue
+        try:
+            results.append(await work(profile, adapter))
+        except (ConfigError, JiraApiError) as exc:
+            errors.append({"profile": profile.resolved_name, "error": str(exc)})
+        finally:
+            await adapter.aclose()
+    return results, errors
 
 
 _SEMANTIC_FIELDS = ("acceptance_criteria", "business_context", "design_links")
@@ -272,19 +304,22 @@ async def transition_issue(
             available = (await adapter.get_transitions(issue_key)).get("transitions", [])
             transition_id = _resolve_transition_id(transition, available)
             await adapter.transition_issue(issue_key, transition_id)
-            # Post the comment separately: a transition screen without a comment field
-            # would otherwise drop it silently.
-            commented = False
-            if comment:
-                await adapter.add_comment(issue_key, comment)
-                commented = True
-            return {
+            # Post the comment separately (a comment-less transition screen would drop it).
+            # The transition already succeeded, so a comment failure is reported, not raised.
+            result: dict[str, Any] = {
                 "issue_key": issue_key,
                 "status": "transitioned",
                 "transition_id": transition_id,
-                "commented": commented,
+                "commented": False,
                 "url": _browse_url(profile, issue_key),
             }
+            if comment:
+                try:
+                    await adapter.add_comment(issue_key, comment)
+                    result["commented"] = True
+                except (ConfigError, JiraApiError) as exc:
+                    result["comment_error"] = str(exc)
+            return result
         finally:
             await adapter.aclose()
     except (ConfigError, JiraApiError) as exc:
@@ -308,9 +343,7 @@ async def create_issue(
     """
     del ctx
     try:
-        project_key = project_or_prefix.strip().upper()
-        profile = resolve_profile_for_issue_key(project_key)
-        adapter = build_jira_adapter(profile)
+        profile, adapter, project_key = _resolve_project_context(project_or_prefix)
         try:
             payload: dict[str, Any] = {
                 "project": {"key": project_key},
@@ -387,46 +420,35 @@ async def my_issues(
     if only_open:
         clauses.append("statusCategory != Done")
     if project:
-        clauses.append(f"project = {project.strip().upper()}")
+        clauses.append(f'project = "{project.strip().upper()}"')
     jql = " AND ".join(clauses) + " ORDER BY updated DESC"
 
-    try:
-        profiles = load_jira_profiles()
-    except ConfigError as exc:
-        raise _translate_error(exc) from exc
+    async def _work(profile: JiraProfile, adapter: JiraAdapter) -> dict[str, Any]:
+        data = await adapter.search_issues(jql, fields=_MY_ISSUES_FIELDS, max_results=max_results)
+        fetched = data.get("issues", [])
+        total = data.get("total", len(fetched))
 
-    issues: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    for profile in profiles:
-        try:
-            adapter = build_jira_adapter(profile)
-        except (ConfigError, JiraApiError) as exc:
-            errors.append({"profile": profile.resolved_name, "error": str(exc)})
-            continue
-        try:
-            data = await adapter.search_issues(jql, fields=_MY_ISSUES_FIELDS, max_results=max_results)
-        except (ConfigError, JiraApiError) as exc:
-            errors.append({"profile": profile.resolved_name, "error": str(exc)})
-            data = None
-        finally:
-            await adapter.aclose()
-        for item in (data or {}).get("issues", []):
-            fields = item.get("fields", {})
-            issues.append(
-                {
-                    "key": item.get("key"),
-                    "summary": fields.get("summary"),
-                    "status": (fields.get("status") or {}).get("name"),
-                    "type": (fields.get("issuetype") or {}).get("name"),
-                    "priority": (fields.get("priority") or {}).get("name"),
-                    "project": (fields.get("project") or {}).get("key"),
-                    "updated": fields.get("updated"),
-                    "url": _browse_url(profile, item.get("key")),
-                }
-            )
+        def _row(item: dict[str, Any]) -> dict[str, Any]:
+            f = item.get("fields", {})
+            return {
+                "key": item.get("key"),
+                "summary": f.get("summary"),
+                "status": (f.get("status") or {}).get("name"),
+                "type": (f.get("issuetype") or {}).get("name"),
+                "priority": (f.get("priority") or {}).get("name"),
+                "project": (f.get("project") or {}).get("key"),
+                "updated": f.get("updated"),
+                "url": _browse_url(profile, item.get("key")),
+            }
+
+        return {"rows": [_row(item) for item in fetched], "truncated": total > len(fetched)}
+
+    per_profile, errors = await _collect_across_profiles(_work)
+    issues = [row for chunk in per_profile for row in chunk["rows"]]
     # Global sort so the merge across profiles is truly ordered, not just grouped.
     issues.sort(key=lambda issue: issue.get("updated") or "", reverse=True)
-    return {"count": len(issues), "jql": jql, "issues": issues, "errors": errors}
+    truncated = any(chunk["truncated"] for chunk in per_profile)
+    return {"count": len(issues), "jql": jql, "truncated": truncated, "issues": issues, "errors": errors}
 
 
 @mcp.tool()
@@ -437,36 +459,18 @@ async def whoami(ctx: Context) -> dict[str, Any]:
     Cloud uses `account_id`. Nothing is modified.
     """
     del ctx
-    try:
-        profiles = load_jira_profiles()
-    except ConfigError as exc:
-        raise _translate_error(exc) from exc
 
-    users: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    for profile in profiles:
-        try:
-            adapter = build_jira_adapter(profile)
-        except (ConfigError, JiraApiError) as exc:
-            errors.append({"profile": profile.resolved_name, "error": str(exc)})
-            continue
-        try:
-            me = await adapter.get_myself()
-        except (ConfigError, JiraApiError) as exc:
-            errors.append({"profile": profile.resolved_name, "error": str(exc)})
-            me = None
-        finally:
-            await adapter.aclose()
-        if me:
-            users.append(
-                {
-                    "profile": profile.resolved_name,
-                    "name": me.get("name"),
-                    "account_id": me.get("accountId"),
-                    "display_name": me.get("displayName"),
-                    "email": me.get("emailAddress"),
-                }
-            )
+    async def _work(profile: JiraProfile, adapter: JiraAdapter) -> dict[str, Any]:
+        me = await adapter.get_myself()
+        return {
+            "profile": profile.resolved_name,
+            "name": me.get("name"),
+            "account_id": me.get("accountId"),
+            "display_name": me.get("displayName"),
+            "email": me.get("emailAddress"),
+        }
+
+    users, errors = await _collect_across_profiles(_work)
     return {"users": users, "errors": errors}
 
 
@@ -478,9 +482,7 @@ async def list_issue_types(project_or_prefix: str, ctx: Context) -> dict[str, An
     """
     del ctx
     try:
-        project_key = project_or_prefix.strip().upper()
-        profile = resolve_profile_for_issue_key(project_key)
-        adapter = build_jira_adapter(profile)
+        _, adapter, project_key = _resolve_project_context(project_or_prefix)
         try:
             meta = await adapter.get_create_meta(project_key, expand="projects.issuetypes")
         finally:
@@ -504,10 +506,9 @@ async def get_create_metadata(project_or_prefix: str, issue_type: str, ctx: Cont
     """
     del ctx
     try:
-        project_key = project_or_prefix.strip().upper()
         wanted = issue_type.strip().lower()
-        profile = resolve_profile_for_issue_key(project_key)
-        adapter = build_jira_adapter(profile)
+        wanted_id = issue_type.strip()
+        _, adapter, project_key = _resolve_project_context(project_or_prefix)
         try:
             meta = await adapter.get_create_meta(project_key, expand="projects.issuetypes.fields")
         finally:
@@ -515,11 +516,14 @@ async def get_create_metadata(project_or_prefix: str, issue_type: str, ctx: Cont
         all_fields: list[dict[str, Any]] | None = None
         for proj in meta.get("projects", []):
             for it in proj.get("issuetypes", []):
-                if str(it.get("name", "")).strip().lower() == wanted or str(it.get("id")) == issue_type.strip():
+                if str(it.get("name", "")).strip().lower() == wanted or str(it.get("id")) == wanted_id:
                     all_fields = [
                         {"id": fid, "name": spec.get("name"), "required": spec.get("required", False)}
                         for fid, spec in it.get("fields", {}).items()
                     ]
+                    break
+            if all_fields is not None:
+                break
         if all_fields is None:
             raise ValueError(f"Issue type '{issue_type}' not found for project {project_key}.")
         return {

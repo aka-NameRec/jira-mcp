@@ -220,7 +220,7 @@ def test_my_issues_all_and_project_filter(fake: FakeAdapter) -> None:
     asyncio.run(_fn(server.my_issues)(None, only_open=False, project="mkt"))
     jql = fake.calls[0][1]
     assert "statusCategory != Done" not in jql  # only_open=False drops the filter
-    assert "project = MKT" in jql
+    assert 'project = "MKT"' in jql
 
 
 def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,3 +287,80 @@ def test_get_create_metadata_required_fields(fake: FakeAdapter) -> None:
 def test_get_create_metadata_unknown_type_raises(fake: FakeAdapter) -> None:
     with pytest.raises(ValueError, match="not found"):
         asyncio.run(_fn(server.get_create_metadata)("BL", "Nope", None))
+
+
+def test_get_create_metadata_resolves_by_id(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.get_create_metadata)("BL", "10", None))  # Dev SubTask id
+    assert {f["id"] for f in result["required_fields"]} == {"summary", "parent"}
+
+
+def test_transition_issue_comment_failure_is_reported(
+    fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jira_mcp.jira_api import JiraApiError
+
+    async def boom(issue_key: str, body: str) -> dict[str, Any]:
+        raise JiraApiError("transition screen has no comment field")
+
+    monkeypatch.setattr(fake, "add_comment", boom)
+    result = asyncio.run(_fn(server.transition_issue)("BL-1", "done", None, "note"))
+    # Transition already landed; comment failure is reported, not raised.
+    assert result["status"] == "transitioned"
+    assert result["commented"] is False
+    assert "comment_error" in result
+    assert ("transition", "BL-1", "31") in fake.calls
+
+
+def test_create_issue_missing_key_url_none(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_key(fields: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(fake, "create_issue", no_key)
+    result = asyncio.run(_fn(server.create_issue)("BL", "Dev Task", "S", None))
+    assert result["issue_key"] is None
+    assert result["url"] is None
+
+
+def test_my_issues_reports_truncation(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def big(jql: str, *, fields, max_results: int = 50, start_at: int = 0) -> dict[str, Any]:
+        return {"issues": [{"key": "BL-1", "fields": {"updated": "2026-01-01"}}], "total": 99}
+
+    monkeypatch.setattr(fake, "search_issues", big)
+    result = asyncio.run(_fn(server.my_issues)(None))
+    assert result["truncated"] is True
+
+
+def test_whoami_isolates_profile_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jira_mcp.jira_api import JiraApiError
+
+    p_ok = JiraProfile(base_url="https://a.test", token="t", issue_key_prefixes=["A"])
+    p_bad = JiraProfile(base_url="https://b.test", token="t", issue_key_prefixes=["B"])
+
+    class Ok:
+        def __init__(self, profile: JiraProfile) -> None:
+            self.profile = profile
+
+        async def aclose(self) -> None:
+            return None
+
+        async def get_myself(self) -> dict[str, Any]:
+            return {"name": "me@x", "displayName": "Me"}
+
+    class Bad:
+        def __init__(self, profile: JiraProfile) -> None:
+            self.profile = profile
+
+        async def aclose(self) -> None:
+            return None
+
+        async def get_myself(self) -> dict[str, Any]:
+            raise JiraApiError("401 Unauthorized")
+
+    adapters = {p_ok.normalized_base_url: Ok(p_ok), p_bad.normalized_base_url: Bad(p_bad)}
+    monkeypatch.setattr(server, "load_jira_profiles", lambda: [p_ok, p_bad])
+    monkeypatch.setattr(server, "build_jira_adapter", lambda prof: adapters[prof.normalized_base_url])
+
+    result = asyncio.run(_fn(server.whoami)(None))
+    assert [u["name"] for u in result["users"]] == ["me@x"]
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["profile"] == p_bad.resolved_name
