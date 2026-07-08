@@ -268,6 +268,157 @@ def test_get_create_meta_reads_with_params() -> None:
     assert seen["params"]["expand"] == "projects.issuetypes"
 
 
+def test_add_worklog_posts_body_and_adjust_param() -> None:
+    seen, handler = _capture(201, json_body={"id": "77", "timeSpent": "3h", "timeSpentSeconds": 10800})
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler, deployment="dc")
+        try:
+            return await adapter.add_worklog(
+                "BL-1", time_spent="3h", comment="did work", started="2026-07-08T10:00:00.000+0600"
+            )
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/worklog")
+    assert seen["params"]["adjustEstimate"] == "auto"
+    assert seen["body"] == {
+        "timeSpent": "3h",
+        "comment": "did work",  # DC / API v2 uses a plain string
+        "started": "2026-07-08T10:00:00.000+0600",
+    }
+    assert result["id"] == "77"
+
+
+def test_add_worklog_omits_optional_fields() -> None:
+    seen, handler = _capture(201, json_body={"id": "1"})
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.add_worklog("BL-1", time_spent="30m", adjust_estimate="leave")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["body"] == {"timeSpent": "30m"}  # no comment / started keys
+    assert seen["params"]["adjustEstimate"] == "leave"
+
+
+def test_add_worklog_wraps_comment_adf_on_cloud() -> None:
+    seen, handler = _capture(201, json_body={"id": "1"})
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="cloud")
+        try:
+            await adapter.add_worklog("BL-1", time_spent="1h", comment="hi")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    body = seen["body"]["comment"]
+    assert body["type"] == "doc"
+    assert body["content"][0]["content"][0]["text"] == "hi"
+
+
+def test_get_worklogs_reads() -> None:
+    seen, handler = _capture(200, json_body={"total": 1, "worklogs": [{"id": "9"}]})
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler)
+        try:
+            return await adapter.get_worklogs("BL-1")
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/worklog")
+    assert result["worklogs"][0]["id"] == "9"
+
+
+def test_search_users_uses_username_param_on_dc() -> None:
+    seen, handler = _capture(200, json_body=[{"name": "u@x", "displayName": "U"}])
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler, deployment="dc")
+        try:
+            return await adapter.search_users("omurkulov", max_results=5)
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/api/2/user/search")
+    assert seen["params"]["username"] == "omurkulov"  # DC param, not `query`
+    assert "query" not in seen["params"]
+    assert seen["params"]["maxResults"] == "5"
+    assert result[0]["name"] == "u@x"
+
+
+def test_search_users_uses_query_param_on_cloud() -> None:
+    seen, handler = _capture(200, json_body=[])
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="cloud")
+        try:
+            await adapter.search_users("john")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["path"].endswith("/rest/api/3/user/search")
+    assert seen["params"]["query"] == "john"  # Cloud param
+    assert "username" not in seen["params"]
+
+
+def test_assign_issue_puts_name_on_dc() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="dc")
+        try:
+            await adapter.assign_issue("BL-1", "asataev@devcats.kg")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "PUT"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/assignee")
+    assert seen["body"] == {"name": "asataev@devcats.kg"}
+
+
+def test_assign_issue_null_name_unassigns_on_dc() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="dc")
+        try:
+            await adapter.assign_issue("BL-1", None)
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["body"] == {"name": None}  # None clears the assignee
+
+
+def test_assign_issue_puts_accountid_on_cloud() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="cloud")
+        try:
+            await adapter.assign_issue("BL-1", "acc-123")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["path"].endswith("/rest/api/3/issue/BL-1/assignee")
+    assert seen["body"] == {"accountId": "acc-123"}
+
+
 def test_non_2xx_raises_jira_api_error() -> None:
     _, handler = _capture(400, text="Field 'summary' is required")
 

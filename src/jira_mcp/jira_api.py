@@ -50,6 +50,22 @@ class JiraAdapter(Protocol):
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]: ...
 
+    async def get_worklogs(self, issue_key: str) -> dict[str, Any]: ...
+
+    async def add_worklog(
+        self,
+        issue_key: str,
+        *,
+        time_spent: str,
+        comment: str | None = None,
+        started: str | None = None,
+        adjust_estimate: str = "auto",
+    ) -> dict[str, Any]: ...
+
+    async def search_users(self, query: str, *, max_results: int = 20) -> list[dict[str, Any]]: ...
+
+    async def assign_issue(self, issue_key: str, assignee: str | None) -> None: ...
+
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None: ...
 
     def build_api_issue_url(self, issue_key: str) -> str: ...
@@ -210,6 +226,48 @@ class BaseJiraApiClient:
 
     async def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/issue", json={"fields": self._prepare_fields(fields)})
+
+    async def get_worklogs(self, issue_key: str) -> dict[str, Any]:
+        return await self._request("GET", f"/issue/{issue_key}/worklog")
+
+    async def add_worklog(
+        self,
+        issue_key: str,
+        *,
+        time_spent: str,
+        comment: str | None = None,
+        started: str | None = None,
+        adjust_estimate: str = "auto",
+    ) -> dict[str, Any]:
+        # POST returns 201 with the created worklog. `timeSpent` uses Jira duration syntax
+        # ("3h", "1h 30m"); `started` (if given) is an ISO-8601 timestamp, else Jira defaults
+        # it to now. `adjustEstimate` is a query param, not part of the body.
+        body: dict[str, Any] = {"timeSpent": time_spent}
+        if comment:
+            body["comment"] = self._comment_body(comment)
+        if started:
+            body["started"] = started
+        return await self._request(
+            "POST",
+            f"/issue/{issue_key}/worklog",
+            params={"adjustEstimate": adjust_estimate},
+            json=body,
+        )
+
+    async def search_users(self, query: str, *, max_results: int = 20) -> list[dict[str, Any]]:
+        # Data Center / API v2 matches the query against username, display name and email via
+        # the `username` param; Cloud / API v3 uses `query`. Display names are stored as given
+        # (Latin on our instance), so a differently-scripted query will not match.
+        param = "query" if self.api_version == "3" else "username"
+        return await self._request(
+            "GET", "/user/search", params={param: query, "maxResults": max_results}
+        )
+
+    async def assign_issue(self, issue_key: str, assignee: str | None) -> None:
+        # PUT returns 204 No Content. Data Center identifies the user by `name` (username,
+        # often the email); Cloud by `accountId`. assignee=None clears the assignee.
+        key = "accountId" if self.api_version == "3" else "name"
+        await self._send("PUT", f"/issue/{issue_key}/assignee", json={key: assignee})
 
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None:
         if not maybe_relative_url:

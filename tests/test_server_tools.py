@@ -75,6 +75,52 @@ class FakeAdapter:
             "emailAddress": "asataev@devcats.kg",
         }
 
+    async def add_worklog(
+        self,
+        issue_key: str,
+        *,
+        time_spent: str,
+        comment: str | None = None,
+        started: str | None = None,
+        adjust_estimate: str = "auto",
+    ) -> dict[str, Any]:
+        self.calls.append(("worklog", issue_key, time_spent, comment, started, adjust_estimate))
+        return {
+            "id": "700",
+            "timeSpent": time_spent,
+            "timeSpentSeconds": 10800,
+            "started": started or "2026-07-08T10:00:00.000+0600",
+        }
+
+    async def get_worklogs(self, issue_key: str) -> dict[str, Any]:
+        return {
+            "total": 1,
+            "worklogs": [
+                {
+                    "id": "700",
+                    "author": {"displayName": "Adilet Sataev"},
+                    "timeSpent": "3h",
+                    "timeSpentSeconds": 10800,
+                    "started": "2026-07-08T10:00:00.000+0600",
+                    "comment": "did work",
+                }
+            ],
+        }
+
+    async def search_users(self, query: str, *, max_results: int = 20) -> list[dict[str, Any]]:
+        self.calls.append(("search_users", query, max_results))
+        return [
+            {
+                "name": "aomurkulov@devcats.kg",
+                "displayName": "Aidin Omurkulov",
+                "emailAddress": "aomurkulov@devcats.kg",
+                "active": True,
+            }
+        ]
+
+    async def assign_issue(self, issue_key: str, assignee: str | None) -> None:
+        self.calls.append(("assign", issue_key, assignee))
+
     async def get_create_meta(self, project_key: str, *, expand: str | None = None) -> dict[str, Any]:
         return {
             "projects": [
@@ -223,7 +269,38 @@ def test_my_issues_all_and_project_filter(fake: FakeAdapter) -> None:
     assert 'project = "MKT"' in jql
 
 
-def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_my_issues_sorts_merge_across_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A genuine multi-profile merge is re-sorted by `updated` desc so the union is ordered,
+    # not just grouped by profile.
+    p_a = JiraProfile(base_url="https://a.test", token="t", issue_key_prefixes=["A"])
+    p_b = JiraProfile(base_url="https://b.test", token="t", issue_key_prefixes=["B"])
+
+    def make(profile: JiraProfile, key: str, updated: str):
+        class Ok:
+            def __init__(self, prof: JiraProfile) -> None:
+                self.profile = prof
+
+            async def aclose(self) -> None:
+                return None
+
+            async def search_issues(self, jql, *, fields, max_results=50, start_at=0):
+                return {"issues": [{"key": key, "fields": {"project": {"key": key[0]}, "updated": updated}}]}
+
+        return Ok(profile)
+
+    adapters = {
+        p_a.normalized_base_url: make(p_a, "A-1", "2026-01-01"),
+        p_b.normalized_base_url: make(p_b, "B-1", "2026-03-01"),
+    }
+    monkeypatch.setattr(server, "load_jira_profiles", lambda: [p_a, p_b])
+    monkeypatch.setattr(server, "build_jira_adapter", lambda prof: adapters[prof.normalized_base_url])
+
+    result = asyncio.run(_fn(server.my_issues)(None))
+    assert [i["key"] for i in result["issues"]] == ["B-1", "A-1"]  # newer first across profiles
+    assert result["errors"] == []
+
+
+def test_my_issues_isolates_profile_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     from jira_mcp.jira_api import JiraApiError
 
     p_ok = JiraProfile(base_url="https://a.test", token="t", issue_key_prefixes=["A"])
@@ -237,12 +314,7 @@ def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest
             return None
 
         async def search_issues(self, jql, *, fields, max_results=50, start_at=0):
-            return {
-                "issues": [
-                    {"key": "A-1", "fields": {"project": {"key": "A"}, "updated": "2026-01-01"}},
-                    {"key": "A-2", "fields": {"project": {"key": "A"}, "updated": "2026-03-01"}},
-                ]
-            }
+            return {"issues": [{"key": "A-1", "fields": {"project": {"key": "A"}, "updated": "2026-01-01"}}]}
 
     class Bad:
         def __init__(self, profile: JiraProfile) -> None:
@@ -259,7 +331,7 @@ def test_my_issues_merges_profiles_isolates_errors_and_sorts(monkeypatch: pytest
     monkeypatch.setattr(server, "build_jira_adapter", lambda prof: adapters[prof.normalized_base_url])
 
     result = asyncio.run(_fn(server.my_issues)(None))
-    assert [i["key"] for i in result["issues"]] == ["A-2", "A-1"]  # global sort by updated desc
+    assert [i["key"] for i in result["issues"]] == ["A-1"]  # good profile still returned
     assert len(result["errors"]) == 1  # bad profile isolated, not fatal
     assert result["errors"][0]["profile"] == p_bad.resolved_name
 
@@ -364,3 +436,155 @@ def test_whoami_isolates_profile_errors(monkeypatch: pytest.MonkeyPatch) -> None
     assert [u["name"] for u in result["users"]] == ["me@x"]
     assert len(result["errors"]) == 1
     assert result["errors"][0]["profile"] == p_bad.resolved_name
+
+
+def test_log_work_shapes_result(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.log_work)("BL-1", "3h", None, "did work"))
+    assert fake.calls == [("worklog", "BL-1", "3h", "did work", None, "auto")]
+    assert result["status"] == "worklog_added"
+    assert result["worklog_id"] == "700"
+    assert result["time_spent"] == "3h"
+    assert result["time_spent_seconds"] == 10800
+    assert result["url"].endswith("/browse/BL-1")
+
+
+def test_log_work_passes_leave_adjust_estimate(fake: FakeAdapter) -> None:
+    asyncio.run(_fn(server.log_work)("BL-1", "1h", None, adjust_estimate="leave"))
+    assert fake.calls[0] == ("worklog", "BL-1", "1h", None, None, "leave")
+
+
+def test_log_work_rejects_bad_adjust_estimate(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="adjust_estimate must be one of"):
+        asyncio.run(_fn(server.log_work)("BL-1", "1h", None, adjust_estimate="manual"))
+    assert fake.calls == []
+
+
+def test_log_work_rejects_empty_time(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="non-empty time_spent"):
+        asyncio.run(_fn(server.log_work)("BL-1", "  ", None))
+    assert fake.calls == []
+
+
+def test_list_worklogs_shapes(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.list_worklogs)("BL-1", None))
+    assert result["count"] == 1
+    assert result["total_time_spent_seconds"] == 10800
+    entry = result["worklogs"][0]
+    assert entry["author"] == "Adilet Sataev"
+    assert entry["time_spent"] == "3h"
+
+
+def test_search_users_across_profiles(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.search_users)("omurkulov", None))
+    assert result["query"] == "omurkulov"
+    assert result["count"] == 1
+    user = result["users"][0]
+    assert user["assignee"] == "aomurkulov@devcats.kg"  # `name` on DC -> what assign_issue takes
+    assert user["display_name"] == "Aidin Omurkulov"
+    assert user["email"] == "aomurkulov@devcats.kg"
+
+
+def test_search_users_rejects_empty(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="non-empty query"):
+        asyncio.run(_fn(server.search_users)("  ", None))
+
+
+def test_assign_issue_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.assign_issue)("BL-1", "aomurkulov@devcats.kg", None))
+    assert fake.calls == [("assign", "BL-1", "aomurkulov@devcats.kg")]
+    assert result["status"] == "assigned"
+    assert result["assignee"] == "aomurkulov@devcats.kg"
+
+
+def test_assign_issue_rejects_empty(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="non-empty assignee"):
+        asyncio.run(_fn(server.assign_issue)("BL-1", "", None))
+    assert fake.calls == []
+
+
+def test_unassign_issue_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.unassign_issue)("BL-1", None))
+    assert fake.calls == [("assign", "BL-1", None)]  # None clears the assignee
+    assert result["status"] == "unassigned"
+
+
+def test_find_issues_by_assignee_single_match(fake: FakeAdapter) -> None:
+    result = asyncio.run(
+        _fn(server.find_issues)(None, assignee="Aidin Omurkulov", status_category="in progress")
+    )
+    assert result["status"] == "ok"
+    assert result["matched_user"]["assignee"] == "aomurkulov@devcats.kg"
+    # JQL resolved to the username and mapped the friendly category.
+    assert 'assignee = "aomurkulov@devcats.kg"' in result["jql"]
+    assert 'statusCategory = "In Progress"' in result["jql"]
+    assert result["issues"][0]["key"] == "BL-1"
+
+
+def test_find_issues_assignee_not_found(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def none(query: str, *, max_results: int = 20) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(fake, "search_users", none)
+    result = asyncio.run(_fn(server.find_issues)(None, assignee="Nobody"))
+    assert result["status"] == "assignee_not_found"
+    assert result["issues"] == []
+    assert result["candidates"] == []
+    assert "hint" in result
+
+
+def test_find_issues_assignee_ambiguous(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def many(query: str, *, max_results: int = 20) -> list[dict[str, Any]]:
+        return [
+            {"name": "aomurkulov@devcats.kg", "displayName": "Aidin Omurkulov"},
+            {"name": "momurkulova@obank.kg", "displayName": "Malika Omurkulova"},
+        ]
+
+    monkeypatch.setattr(fake, "search_users", many)
+    result = asyncio.run(_fn(server.find_issues)(None, assignee="Omurkulov"))
+    assert result["status"] == "assignee_ambiguous"
+    assert len(result["candidates"]) == 2
+    assert result["issues"] == []
+    assert "hint" in result
+
+
+def test_find_issues_broad_without_assignee(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.find_issues)(None, project="bl", status_category="done"))
+    assert result["status"] == "ok"
+    assert 'project = "BL"' in result["jql"]
+    assert 'statusCategory = "Done"' in result["jql"]
+    assert result["issues"][0]["key"] == "BL-1"
+
+
+def test_find_issues_status_category_russian_alias(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.find_issues)(None, status_category="в процессе"))
+    assert 'statusCategory = "In Progress"' in result["jql"]
+
+
+def test_find_issues_order_by_whitelist_falls_back(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.find_issues)(None, order_by="; DROP TABLE"))
+    assert result["jql"].endswith("ORDER BY updated DESC")  # unknown field -> safe default
+
+
+def test_find_issues_broad_preserves_jql_order_single_profile(
+    fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def two(jql: str, *, fields, max_results: int = 50, start_at: int = 0) -> dict[str, Any]:
+        # Returned in the server-side JQL order: older first, newer second.
+        return {
+            "issues": [
+                {"key": "BL-9", "fields": {"project": {"key": "BL"}, "updated": "2026-01-01"}},
+                {"key": "BL-1", "fields": {"project": {"key": "BL"}, "updated": "2026-09-01"}},
+            ]
+        }
+
+    monkeypatch.setattr(fake, "search_issues", two)
+    result = asyncio.run(_fn(server.find_issues)(None, order_by="priority ASC"))
+    # A single profile keeps the JQL order; it must NOT be re-sorted by `updated` desc.
+    assert [i["key"] for i in result["issues"]] == ["BL-9", "BL-1"]
+    assert result["jql"].endswith("ORDER BY priority ASC")
+
+
+def test_find_issues_single_match_reports_resolve_errors(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.find_issues)(None, assignee="Aidin Omurkulov"))
+    assert result["status"] == "ok"
+    assert "errors" in result  # success branch must not swallow per-profile resolve errors

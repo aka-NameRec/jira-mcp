@@ -10,6 +10,28 @@ This project is intentionally narrow. It is designed for agents such as Codex, C
 
 The goal is not broad Jira administration. The goal is to give an agent just enough context to review code, investigate the codebase, and search for implementation decisions grounded in the actual issue discussion.
 
+## Design principle — self-describing, low-friction tools
+
+**A client should be able to use this server correctly on the first try with no external docs.**
+An MCP agent only sees each tool's name, signature, and docstring, plus the server
+`instructions` string — so those must carry everything needed to use the tool safely and
+intuitively. This README is background for humans, not a prerequisite for the agent.
+
+Every tool must therefore:
+- have a docstring that states **what it does, when to use it, whether it reads or mutates**,
+  the meaning and format of each non-obvious argument, and the key fields of the result;
+- surface sharp edges **inline** where they bite (e.g. user search is Latin-only; `log_work`
+  has its own endpoint and is not a settable field; transitions are effectively one-way);
+- return **self-explanatory results** that tell the agent what to do next — e.g. `find_issues`
+  returns `status: "assignee_not_found" | "assignee_ambiguous"` with a `hint` and `candidates`
+  instead of guessing, and `search_users` returns the exact `assignee` value `assign_issue`
+  expects, so multi-step flows (resolve → confirm → assign) are discoverable without a manual.
+
+The server `instructions` string is the map: it groups read vs write tools and spells out the
+cross-tool flows. When you add or change a tool, updating its docstring and the `instructions`
+string is part of the change — if an agent would have to read this README to use the tool, the
+docstring is incomplete.
+
 ## Tooling Scope
 
 Read-only:
@@ -17,6 +39,9 @@ Read-only:
 - `get_issue_for_review` — compact issue + comments + attachments + linked work.
 - `list_transitions` — workflow transitions available from the issue's current status.
 - `my_issues` — issues assigned to the current user across all configured profiles.
+- `find_issues` — search issues by flexible filters, incl. another person by name (resolved, no id needed); reports not-found / ambiguous instead of guessing.
+- `search_users` — find users by name / username / email; returns the `assignee` value to pass to `assign_issue`.
+- `list_worklogs` — worklog entries (logged time) on an issue, plus total seconds.
 - `whoami` — the current user per profile (use for assignee identity).
 - `list_issue_types` — issue types available for creating issues in a project.
 - `get_create_metadata` — fields (and which are required) for creating a given issue type.
@@ -24,6 +49,8 @@ Read-only:
 Write (mutate real Jira — use with explicit intent):
 - `update_issue` — set fields; `add` / `remove` change multi-value fields via Jira's update verb without clobbering.
 - `add_comment`, `delete_comment` (destructive), `transition_issue` (by id/name, optional comment), `create_issue`.
+- `log_work` — log time on an issue (Jira duration like `3h`, `1h 30m`); its own endpoint, not a settable field.
+- `assign_issue` / `unassign_issue` — assign to a user by the `assignee` value from `search_users`, or clear it.
 
 ## Usage & safety
 
@@ -32,7 +59,9 @@ Write tools change real Jira issues. Use them only with explicit user intent and
 - **Read-modify-write for multi-value fields.** `update_issue` SETS fields and replaces multi-value fields (`labels`, `components`, `fixVersions`) and `description`. To change multi-value fields without clobbering, use `add` / `remove` (Jira update verb); each value may be a scalar or a list.
 - **Transitions.** State- and permission-dependent and often one-way. Call `list_transitions` first; reverting a status can take several hops. `transition_issue`'s optional `comment` is posted as a separate comment, so a transition screen without a comment field never silently drops it.
 - **Sub-tasks cannot nest.** Create a sub-task with a sub-task issue type and `fields={"parent": {"key": "<PARENT>"}}` under a standard (non-sub-task) issue.
-- **Assignee.** Data Center: `fields={"assignee": {"name": "<username>"}}` (often the email). Cloud: `accountId`.
+- **Assignee by name, no id needed.** Resolve a person with `search_users` (matches username / display name / email), confirm the right match with the user, then `assign_issue` with the returned `assignee` value; `unassign_issue` clears it. Display names are stored in Latin script, so a Cyrillic query returns nothing — transliterate (`Омуркулов` → `Omurkulov`), and a first+last name disambiguates common surnames. `assign_issue` uses the dedicated `PUT .../assignee` endpoint (DC `name`, Cloud `accountId`), separate from `update_issue`.
+- **Find another person's issues.** `find_issues(assignee="Aidin Omurkulov", status_category="in progress")` resolves the name and lists their issues; `status='assignee_not_found'` / `'assignee_ambiguous'` (with candidates, no issues) mean *ask the user*, don't guess. `status_category` accepts friendly EN/RU synonyms (`in progress` / `в процессе` → `In Progress`); `order_by` is whitelisted against JQL injection.
+- **Worklog / logged time.** `log_work` posts to `POST .../worklog` (`timeSpent` in Jira duration syntax; `started` defaults to now if omitted; `adjust_estimate` is `auto` or `leave`). It is NOT settable through `update_issue`. `list_worklogs` reviews existing entries. There is no worklog-delete tool — remove a mistaken entry in the Jira UI.
 - **Irreversibility.** `delete_comment` is permanent; `create_issue` has no delete (cancel instead).
 - **`notify_users=false`** requires Jira admin rights (403 otherwise) — leave the default.
 - **Field aliases.** `update_issue` / `create_issue` accept `acceptance_criteria` / `business_context` / `design_links`, mapped to the profile's `field_mappings` customfield ids.
