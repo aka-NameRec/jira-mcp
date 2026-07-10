@@ -66,6 +66,27 @@ class JiraAdapter(Protocol):
 
     async def assign_issue(self, issue_key: str, assignee: str | None) -> None: ...
 
+    async def get_link_types(self) -> dict[str, Any]: ...
+
+    async def create_issue_link(
+        self,
+        link_type: str,
+        *,
+        inward_issue: str,
+        outward_issue: str,
+        comment: str | None = None,
+    ) -> None: ...
+
+    async def get_priorities(self) -> list[dict[str, Any]]: ...
+
+    async def get_boards(self, project_key: str, *, max_results: int = 50) -> dict[str, Any]: ...
+
+    async def get_board_sprints(
+        self, board_id: int | str, *, state: str | None = None, max_results: int = 50
+    ) -> dict[str, Any]: ...
+
+    async def add_issue_to_sprint(self, sprint_id: int | str, issue_key: str) -> None: ...
+
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None: ...
 
     def build_api_issue_url(self, issue_key: str) -> str: ...
@@ -268,6 +289,61 @@ class BaseJiraApiClient:
         # often the email); Cloud by `accountId`. assignee=None clears the assignee.
         key = "accountId" if self.api_version == "3" else "name"
         await self._send("PUT", f"/issue/{issue_key}/assignee", json={key: assignee})
+
+    async def get_link_types(self) -> dict[str, Any]:
+        return await self._request("GET", "/issueLinkType")
+
+    async def create_issue_link(
+        self,
+        link_type: str,
+        *,
+        inward_issue: str,
+        outward_issue: str,
+        comment: str | None = None,
+    ) -> None:
+        # POST returns 201 with an empty body on success. The relationship reads
+        # "outwardIssue <type.outward> inwardIssue" (e.g. for "Blocks": outward blocks inward).
+        body: dict[str, Any] = {
+            "type": {"name": link_type},
+            "inwardIssue": {"key": inward_issue},
+            "outwardIssue": {"key": outward_issue},
+        }
+        if comment:
+            body["comment"] = {"body": self._comment_body(comment)}
+        await self._send("POST", "/issueLink", json=body)
+
+    async def get_priorities(self) -> list[dict[str, Any]]:
+        # GET returns a top-level JSON array of the instance-global priorities.
+        return await self._request("GET", "/priority")
+
+    def _agile_url(self, path: str) -> str:
+        # The Jira Agile API lives outside /rest/api/{v}. httpx uses this absolute URL as-is
+        # while still sending the same client's auth headers, so no separate client is needed.
+        return f"{self.profile.normalized_base_url}/rest/agile/1.0{path}"
+
+    async def get_boards(self, project_key: str, *, max_results: int = 50) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            self._agile_url("/board"),
+            params={"projectKeyOrId": project_key, "maxResults": max_results},
+        )
+
+    async def get_board_sprints(
+        self, board_id: int | str, *, state: str | None = None, max_results: int = 50
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"maxResults": max_results}
+        if state:
+            params["state"] = state
+        return await self._request(
+            "GET", self._agile_url(f"/board/{board_id}/sprint"), params=params
+        )
+
+    async def add_issue_to_sprint(self, sprint_id: int | str, issue_key: str) -> None:
+        # POST returns 204 No Content on success. Preferred over writing the Sprint customfield
+        # directly (no field id needed).
+        await self._send(
+            "POST", self._agile_url(f"/sprint/{sprint_id}/issue"), json={"issues": [issue_key]}
+        )
 
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None:
         if not maybe_relative_url:

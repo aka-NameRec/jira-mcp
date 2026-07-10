@@ -26,10 +26,21 @@ mcp = FastMCP(
         "URLs or configured issue-key prefixes.\n"
         "Read tools (get_issue_for_review, parse_issue_url, list_transitions, my_issues, "
         "find_issues, search_users, list_worklogs, whoami, list_issue_types, "
-        "get_create_metadata) do not mutate. Write tools (update_issue, add_comment, "
-        "delete_comment, transition_issue, create_issue, log_work, assign_issue, "
-        "unassign_issue) change real issues — use only with explicit user intent, and confirm "
-        "before destructive or hard-to-reverse actions.\n"
+        "get_create_metadata, list_link_types, list_priorities, find_sprints) do not mutate. "
+        "Write tools (update_issue, add_comment, delete_comment, transition_issue, "
+        "create_issue, log_work, assign_issue, unassign_issue, link_issues, set_sprint) change "
+        "real issues — use only with explicit user intent, and confirm before destructive or "
+        "hard-to-reverse actions.\n"
+        "Common recipes (compose small tools; there is no mega-tool):\n"
+        "- Create a task for a teammate, in a sprint, with priority and estimate: search_users "
+        "-> confirm the person -> create_issue(fields={'priority': {'name': 'High'}, "
+        "'timetracking': {'originalEstimate': '2h'}}) -> set_sprint(new_key, <id from "
+        "find_sprints>). Use list_priorities / find_sprints first to get exact values.\n"
+        "- Make issue A block issue B: link_issues(outward_issue='A', inward_issue='B', "
+        "link_type='Blocks'); list_link_types shows valid names/phrases.\n"
+        "- Set the deadline vs the estimate: a due date is fields={'duedate': 'YYYY-MM-DD'}; a "
+        "bare duration like '2h' is an estimate (timetracking.originalEstimate); time already "
+        "spent is log_work — these are three different things.\n"
         "Operational notes:\n"
         "- update_issue SETS fields and replaces multi-value fields (labels, components); use "
         "add/remove to change them without clobbering existing values.\n"
@@ -51,6 +62,14 @@ mcp = FastMCP(
         "update_issue (worklog is not a settable field). list_worklogs reviews logged time.\n"
         "- Before create_issue on an unfamiliar project, use list_issue_types and "
         "get_create_metadata to pick a valid type and satisfy required fields.\n"
+        "- link_issues links two issues on the SAME instance; the sentence is 'outward_issue "
+        "<type> inward_issue'. Pass a link_type name or a directional phrase — naming the "
+        "inward phrase swaps the issues automatically. See list_link_types for valid values.\n"
+        "- find_sprints needs Jira Software scrum boards; if it returns several sprints, ask the "
+        "user which one and never guess. set_sprint takes the numeric sprint id it returned. "
+        "Sub-tasks follow their parent's sprint — set_sprint on a sub-task reports success but "
+        "does not move it; sprint the parent instead.\n"
+        "- Priority names are instance-specific — call list_priorities before setting one.\n"
         "- delete_comment is irreversible; create_issue has no delete (cancel instead); "
         "notify_users=false needs Jira admin rights."
     ),
@@ -66,13 +85,19 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
-async def _resolve_issue_context(issue_key_or_url: str) -> tuple[JiraProfile, JiraAdapter, str]:
+def _resolve_issue_profile(issue_key_or_url: str) -> tuple[JiraProfile, str]:
+    """Resolve (profile, issue_key) from an issue key or URL, without building an adapter."""
     if _is_url(issue_key_or_url):
         profile = resolve_profile_for_url(issue_key_or_url)
         _, issue_key = parse_issue_url_parts(issue_key_or_url)
     else:
         issue_key = issue_key_or_url.strip().upper()
         profile = resolve_profile_for_issue_key(issue_key)
+    return profile, issue_key
+
+
+async def _resolve_issue_context(issue_key_or_url: str) -> tuple[JiraProfile, JiraAdapter, str]:
+    profile, issue_key = _resolve_issue_profile(issue_key_or_url)
     return profile, build_jira_adapter(profile), issue_key
 
 
@@ -139,6 +164,50 @@ def _resolve_transition_id(transition: str, available: list[dict[str, Any]]) -> 
             return str(item["id"])
     names = ", ".join(f"{item.get('name')} (id={item.get('id')})" for item in available) or "none"
     raise ValueError(f"No transition matching '{transition}'. Available: {names}.")
+
+
+def _resolve_link_type(link_type: str, available: list[dict[str, Any]]) -> tuple[str, bool]:
+    """Resolve a link type name + orientation from a type name or a directional phrase.
+
+    Matches (case-insensitively) the type name, then its outward phrase, then its inward
+    phrase. Returns (canonical_name, swap): swap=True means the caller named the INWARD phrase,
+    so the outward/inward issues must be swapped for the relationship sentence to hold.
+    """
+    wanted = link_type.strip().lower()
+    for item in available:
+        if str(item.get("name", "")).strip().lower() == wanted:
+            return str(item.get("name")), False
+    for item in available:
+        if str(item.get("outward", "")).strip().lower() == wanted:
+            return str(item.get("name")), False
+    for item in available:
+        if str(item.get("inward", "")).strip().lower() == wanted:
+            return str(item.get("name")), True
+    options = (
+        "; ".join(
+            f"{item.get('name')} (outward: '{item.get('outward')}', inward: '{item.get('inward')}')"
+            for item in available
+        )
+        or "none"
+    )
+    raise ValueError(f"No link type matching '{link_type}'. Available: {options}.")
+
+
+_SPRINT_STATES = ("active", "future", "closed")
+
+
+def _normalize_sprint_state(state: str) -> str:
+    """Validate a comma list of sprint states (or 'all') against the known Agile states."""
+    raw = state.strip().lower()
+    if raw == "all":
+        return ",".join(_SPRINT_STATES)
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    invalid = [token for token in tokens if token not in _SPRINT_STATES]
+    if not tokens or invalid:
+        raise ValueError(
+            f"state must be a comma list of {_SPRINT_STATES} or 'all'; got '{state}'."
+        )
+    return ",".join(tokens)
 
 
 def _as_list(values: Any) -> list[Any]:
@@ -296,6 +365,15 @@ async def update_issue(
     To change multi-value fields (labels, components, ...) WITHOUT clobbering existing
     values, use `add` / `remove`: a mapping of field id -> list of values applied via Jira's
     update verb, e.g. add={"labels": ["china"]}, remove={"labels": ["old"]}.
+
+    Common extra `fields`:
+    - priority: {"priority": {"name": "High"}} — names are instance-specific, so call
+      list_priorities first (this instance has both "High" and "Highest").
+    - original estimate (planned time to complete): {"timetracking": {"originalEstimate": "2h"}}
+      — a bare duration like "2h"/"1d" is an ESTIMATE, NOT a deadline.
+    - due date (a calendar deadline): {"duedate": "YYYY-MM-DD"}.
+    Time ALREADY spent is not set here — use log_work. If the user just says "set 2h", ask
+    whether that means the estimate or a due date before choosing.
     """
     del ctx
     if not fields and not add and not remove:
@@ -421,6 +499,12 @@ async def create_issue(
     `project_or_prefix` is the target Jira project key (e.g. "BL"); it also selects the
     profile by matching a configured issue-key prefix. `fields` may carry extra Jira fields
     or the semantic aliases translated to customfield ids.
+
+    Useful `fields`: assignee {"assignee": {"name": "user@devcats.kg"}} (or assign_issue after
+    create); priority {"priority": {"name": "High"}} (see list_priorities); an original
+    estimate {"timetracking": {"originalEstimate": "2h"}} (a bare duration is an ESTIMATE, not
+    a deadline); a due date {"duedate": "YYYY-MM-DD"}; a sub-task parent {"parent": {"key":
+    "BL-100"}}. To put the new issue in a sprint, call set_sprint with the returned key.
     """
     del ctx
     try:
@@ -910,6 +994,260 @@ async def find_issues(
         "issues": issues,
         "errors": errors,
     }
+
+
+@mcp.tool()
+async def list_link_types(ctx: Context) -> dict[str, Any]:
+    """List the issue link types available on each configured Jira instance (read-only).
+
+    Use before link_issues to pick a valid `link_type`. Each entry gives the type `name`
+    (e.g. "Blocks", "Relates", "Duplicate") and its directional phrases: `outward` (how the
+    outward issue relates to the inward one, e.g. "blocks") and `inward` (the reverse, e.g.
+    "is blocked by"). Pass the name OR either phrase to link_issues. Nothing is modified.
+    """
+    del ctx
+
+    async def _work(profile: JiraProfile, adapter: JiraAdapter) -> list[dict[str, Any]]:
+        data = await adapter.get_link_types()
+        return [
+            {
+                "name": item.get("name"),
+                "outward": item.get("outward"),
+                "inward": item.get("inward"),
+                "profile": profile.resolved_name,
+            }
+            for item in data.get("issueLinkTypes", [])
+        ]
+
+    per_profile, errors = await _collect_across_profiles(_work)
+    link_types = [row for chunk in per_profile for row in chunk]
+    return {"count": len(link_types), "link_types": link_types, "errors": errors}
+
+
+@mcp.tool()
+async def link_issues(
+    outward_issue: str,
+    inward_issue: str,
+    link_type: str,
+    ctx: Context,
+    comment: str | None = None,
+) -> dict[str, Any]:
+    """Create a directed link between two Jira issues.
+
+    The relationship reads "`outward_issue` <link_type> `inward_issue`" — e.g.
+    link_issues("BL-1", "BL-2", "Blocks") means BL-1 blocks BL-2. `link_type` may be a type
+    name (see list_link_types) or a directional phrase; if you pass an INWARD phrase (e.g.
+    "is blocked by"), the two issues are swapped automatically so the sentence still holds.
+    Both issues must live on the same Jira instance. Optionally attach a `comment`.
+    """
+    del ctx
+    try:
+        out_profile, out_key = _resolve_issue_profile(outward_issue)
+        in_profile, in_key = _resolve_issue_profile(inward_issue)
+        if out_profile.resolved_name != in_profile.resolved_name:
+            raise ValueError(
+                "Both issues must be on the same Jira instance to link them: "
+                f"{out_key} -> {out_profile.resolved_name}, "
+                f"{in_key} -> {in_profile.resolved_name}."
+            )
+        adapter = build_jira_adapter(out_profile)
+        try:
+            available = (await adapter.get_link_types()).get("issueLinkTypes", [])
+            name, swap = _resolve_link_type(link_type, available)
+            api_outward, api_inward = (in_key, out_key) if swap else (out_key, in_key)
+            await adapter.create_issue_link(
+                name, inward_issue=api_inward, outward_issue=api_outward, comment=comment
+            )
+            outward_phrase = next(
+                (item.get("outward") for item in available if str(item.get("name")) == name), None
+            )
+            return {
+                "status": "linked",
+                "link_type": name,
+                "outward_issue": api_outward,
+                "inward_issue": api_inward,
+                "relationship": (
+                    f"{api_outward} {outward_phrase} {api_inward}" if outward_phrase else name
+                ),
+                "url": _browse_url(out_profile, api_outward),
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def list_priorities(ctx: Context) -> dict[str, Any]:
+    """List the priorities available on each configured Jira instance (read-only).
+
+    Priority names are instance-specific — this instance has both "High" and "Highest" plus
+    custom ones — so check here before setting one. Set a priority via create_issue/update_issue
+    with fields={"priority": {"name": "High"}}. Nothing is modified.
+    """
+    del ctx
+
+    async def _work(profile: JiraProfile, adapter: JiraAdapter) -> list[dict[str, Any]]:
+        data = await adapter.get_priorities()
+        return [
+            {"id": item.get("id"), "name": item.get("name"), "profile": profile.resolved_name}
+            for item in data
+        ]
+
+    per_profile, errors = await _collect_across_profiles(_work)
+    priorities = [row for chunk in per_profile for row in chunk]
+    return {"count": len(priorities), "priorities": priorities, "errors": errors}
+
+
+_NO_SCRUM_BOARD_HINT = (
+    "No scrum board found for this project, so it has no sprints. Only scrum boards have "
+    "sprints — kanban boards do not, and a project without Jira Software has none."
+)
+_NO_SCRUM_BOARD_TRUNCATED_HINT = (
+    "No scrum board in the first page of boards, but the board list was truncated — a scrum "
+    "board may exist beyond the page. Narrow the project or check the boards in the Jira UI."
+)
+_NO_SPRINTS_HINT = (
+    "No sprints matched the requested state. Try state='all' to include closed sprints, or the "
+    "project may have no sprints yet."
+)
+_SPRINT_PICK_HINT = (
+    "Multiple sprints matched. Do not guess — show the candidates to the user and ask which "
+    "sprint, then pass its id to set_sprint."
+)
+
+
+@mcp.tool()
+async def find_sprints(
+    project_or_prefix: str,
+    ctx: Context,
+    state: str = "active,future",
+) -> dict[str, Any]:
+    """Find the sprints of a project's scrum boards (read-only; needs Jira Software).
+
+    `state` is a comma list of active/future/closed (or "all"); default "active,future".
+    Returns each sprint's id, name, state, board, and start/end. A project can have several
+    scrum boards and parallel sprints — if more than one matches what the user wants, ASK which
+    one (the result carries a hint); never guess. Pass a returned sprint id to set_sprint.
+    status="no_board" means the project has no scrum board; "no_sprints" means none matched.
+    Nothing is modified.
+    """
+    del ctx
+    try:
+        normalized_state = _normalize_sprint_state(state)
+        profile, adapter, project_key = _resolve_project_context(project_or_prefix)
+        try:
+            boards_data = await adapter.get_boards(project_key)
+            boards = boards_data.get("values", [])
+            # The board list is paged; flag if a scrum board could sit beyond the fetched page.
+            boards_truncated = not boards_data.get("isLast", True)
+            board_summaries = [
+                {"id": board.get("id"), "name": board.get("name"), "type": board.get("type")}
+                for board in boards
+            ]
+            scrum_boards = [b for b in boards if str(b.get("type", "")).lower() == "scrum"]
+            if not scrum_boards:
+                return {
+                    "status": "no_board",
+                    "project": project_key,
+                    "boards": board_summaries,
+                    "boards_truncated": boards_truncated,
+                    "sprints": [],
+                    "hint": (
+                        _NO_SCRUM_BOARD_TRUNCATED_HINT if boards_truncated else _NO_SCRUM_BOARD_HINT
+                    ),
+                }
+            seen: set[Any] = set()
+            sprints: list[dict[str, Any]] = []
+            board_errors: list[dict[str, str]] = []
+            truncated = False
+            for board in scrum_boards:
+                board_id = board.get("id")
+                try:
+                    data = await adapter.get_board_sprints(board_id, state=normalized_state)
+                except JiraApiError as exc:
+                    board_errors.append(
+                        {"board": str(board.get("name")), "error": str(exc)}
+                    )
+                    continue
+                if not data.get("isLast", True):
+                    truncated = True
+                for sprint in data.get("values", []):
+                    sprint_id = sprint.get("id")
+                    if sprint_id in seen:
+                        continue
+                    seen.add(sprint_id)
+                    sprints.append(
+                        {
+                            "id": sprint_id,
+                            "name": sprint.get("name"),
+                            "state": sprint.get("state"),
+                            "board_id": board_id,
+                            "board_name": board.get("name"),
+                            "start": sprint.get("startDate"),
+                            "end": sprint.get("endDate"),
+                        }
+                    )
+        finally:
+            await adapter.aclose()
+        if not sprints:
+            return {
+                "status": "no_sprints",
+                "project": project_key,
+                "state": normalized_state,
+                "boards": board_summaries,
+                "boards_truncated": boards_truncated,
+                "sprints": [],
+                "errors": board_errors,
+                "hint": _NO_SPRINTS_HINT,
+            }
+        return {
+            "status": "ok",
+            "project": project_key,
+            "state": normalized_state,
+            "boards": board_summaries,
+            "boards_truncated": boards_truncated,
+            "count": len(sprints),
+            "truncated": truncated,
+            "sprints": sprints,
+            "errors": board_errors,
+            "hint": _SPRINT_PICK_HINT if len(sprints) > 1 else None,
+        }
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def set_sprint(issue_key_or_url: str, sprint: str | int, ctx: Context) -> dict[str, Any]:
+    """Move a Jira issue into a sprint (needs Jira Software).
+
+    `sprint` is the numeric sprint id — get it from find_sprints (a sprint name is not
+    accepted, ids are unambiguous). Uses the Agile endpoint, so no Sprint field id is needed.
+
+    Sub-tasks inherit their parent's sprint: the endpoint accepts a sub-task request (returns
+    success) but does NOT actually move it. To sprint a sub-task, set the sprint on its parent
+    (a standard issue) instead.
+    """
+    del ctx
+    sprint_id = str(sprint).strip()
+    if not sprint_id.isdigit():
+        raise ValueError(
+            "set_sprint needs a numeric sprint id, not a name — get it from find_sprints."
+        )
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            await adapter.add_issue_to_sprint(sprint_id, issue_key)
+            return {
+                "issue_key": issue_key,
+                "status": "sprint_set",
+                "sprint_id": sprint_id,
+                "url": _browse_url(profile, issue_key),
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
 
 
 def main() -> None:

@@ -121,6 +121,57 @@ class FakeAdapter:
     async def assign_issue(self, issue_key: str, assignee: str | None) -> None:
         self.calls.append(("assign", issue_key, assignee))
 
+    async def get_link_types(self) -> dict[str, Any]:
+        return {
+            "issueLinkTypes": [
+                {"id": "10000", "name": "Blocks", "outward": "blocks", "inward": "is blocked by"},
+                {"id": "10001", "name": "Relates", "outward": "relates to", "inward": "relates to"},
+            ]
+        }
+
+    async def create_issue_link(
+        self,
+        link_type: str,
+        *,
+        inward_issue: str,
+        outward_issue: str,
+        comment: str | None = None,
+    ) -> None:
+        self.calls.append(("link", link_type, outward_issue, inward_issue, comment))
+
+    async def get_priorities(self) -> list[dict[str, Any]]:
+        return [{"id": "2", "name": "High"}, {"id": "1", "name": "Highest"}]
+
+    async def get_boards(self, project_key: str, *, max_results: int = 50) -> dict[str, Any]:
+        return {
+            "total": 2,
+            "isLast": True,
+            "values": [
+                {"id": 289, "name": "BL board", "type": "kanban"},
+                {"id": 414, "name": "BL Sprints", "type": "scrum"},
+            ],
+        }
+
+    async def get_board_sprints(
+        self, board_id: int | str, *, state: str | None = None, max_results: int = 50
+    ) -> dict[str, Any]:
+        self.calls.append(("board_sprints", board_id, state))
+        return {
+            "isLast": True,
+            "values": [
+                {
+                    "id": 77,
+                    "name": "Sprint 7",
+                    "state": "active",
+                    "startDate": "2026-07-01T00:00:00.000Z",
+                    "endDate": "2026-07-14T00:00:00.000Z",
+                }
+            ],
+        }
+
+    async def add_issue_to_sprint(self, sprint_id: int | str, issue_key: str) -> None:
+        self.calls.append(("set_sprint", sprint_id, issue_key))
+
     async def get_create_meta(self, project_key: str, *, expand: str | None = None) -> dict[str, Any]:
         return {
             "projects": [
@@ -553,6 +604,134 @@ def test_find_issues_broad_without_assignee(fake: FakeAdapter) -> None:
     assert 'project = "BL"' in result["jql"]
     assert 'statusCategory = "Done"' in result["jql"]
     assert result["issues"][0]["key"] == "BL-1"
+
+
+def test_list_link_types_shapes(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.list_link_types)(None))
+    by_name = {t["name"]: t for t in result["link_types"]}
+    assert by_name["Blocks"]["outward"] == "blocks"
+    assert by_name["Blocks"]["inward"] == "is blocked by"
+    assert result["count"] == 2
+
+
+def test_link_issues_by_name(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.link_issues)("BL-1", "BL-2", "Blocks", None))
+    assert ("link", "Blocks", "BL-1", "BL-2", None) in fake.calls
+    assert result["status"] == "linked"
+    assert result["outward_issue"] == "BL-1"
+    assert result["inward_issue"] == "BL-2"
+    assert result["relationship"] == "BL-1 blocks BL-2"
+
+
+def test_link_issues_inward_phrase_swaps(fake: FakeAdapter) -> None:
+    # "BL-1 is blocked by BL-2" == "BL-2 blocks BL-1": the issues swap for the API call.
+    result = asyncio.run(_fn(server.link_issues)("BL-1", "BL-2", "is blocked by", None))
+    assert ("link", "Blocks", "BL-2", "BL-1", None) in fake.calls
+    assert result["outward_issue"] == "BL-2"
+    assert result["inward_issue"] == "BL-1"
+    assert result["relationship"] == "BL-2 blocks BL-1"
+
+
+def test_link_issues_unknown_type_raises(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="No link type matching"):
+        asyncio.run(_fn(server.link_issues)("BL-1", "BL-2", "Nope", None))
+
+
+def test_link_issues_cross_instance_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    p_a = JiraProfile(base_url="https://a.test", token="t", issue_key_prefixes=["A"])
+    p_b = JiraProfile(base_url="https://b.test", token="t", issue_key_prefixes=["B"])
+    profiles = {"A": p_a, "B": p_b}
+    monkeypatch.setattr(
+        server, "resolve_profile_for_issue_key", lambda key: profiles[key.split("-")[0]]
+    )
+    with pytest.raises(ValueError, match="same Jira instance"):
+        asyncio.run(_fn(server.link_issues)("A-1", "B-2", "Blocks", None))
+
+
+def test_list_priorities_shapes(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.list_priorities)(None))
+    names = [p["name"] for p in result["priorities"]]
+    assert "High" in names and "Highest" in names
+    assert result["count"] == 2
+
+
+def test_find_sprints_filters_scrum_and_shapes(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.find_sprints)("BL", None))
+    assert result["status"] == "ok"
+    assert result["count"] == 1
+    sprint = result["sprints"][0]
+    assert sprint["id"] == 77
+    assert sprint["board_name"] == "BL Sprints"
+    # Only the scrum board (414) was queried for sprints; the kanban board (289) was skipped.
+    board_calls = [c for c in fake.calls if c[0] == "board_sprints"]
+    assert board_calls == [("board_sprints", 414, "active,future")]
+
+
+def test_find_sprints_state_all_expands(fake: FakeAdapter) -> None:
+    asyncio.run(_fn(server.find_sprints)("BL", None, state="all"))
+    board_calls = [c for c in fake.calls if c[0] == "board_sprints"]
+    assert board_calls[0][2] == "active,future,closed"
+
+
+def test_find_sprints_rejects_bad_state(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="state must be"):
+        asyncio.run(_fn(server.find_sprints)("BL", None, state="soon"))
+
+
+def test_find_sprints_no_scrum_board(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def only_kanban(project_key: str, *, max_results: int = 50) -> dict[str, Any]:
+        return {"values": [{"id": 1, "name": "K", "type": "kanban"}]}
+
+    monkeypatch.setattr(fake, "get_boards", only_kanban)
+    result = asyncio.run(_fn(server.find_sprints)("BL", None))
+    assert result["status"] == "no_board"
+    assert result["sprints"] == []
+    assert "hint" in result
+
+
+def test_find_sprints_no_sprints(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def empty(board_id: Any, *, state: str | None = None, max_results: int = 50) -> dict[str, Any]:
+        return {"isLast": True, "values": []}
+
+    monkeypatch.setattr(fake, "get_board_sprints", empty)
+    result = asyncio.run(_fn(server.find_sprints)("BL", None))
+    assert result["status"] == "no_sprints"
+    assert result["sprints"] == []
+
+
+def test_find_sprints_reports_boards_truncation(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def paged(project_key: str, *, max_results: int = 50) -> dict[str, Any]:
+        return {"isLast": False, "values": [{"id": 414, "name": "BL Sprints", "type": "scrum"}]}
+
+    monkeypatch.setattr(fake, "get_boards", paged)
+    result = asyncio.run(_fn(server.find_sprints)("BL", None))
+    assert result["status"] == "ok"
+    assert result["boards_truncated"] is True
+
+
+def test_find_sprints_no_board_flags_truncation(fake: FakeAdapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A scrum board could sit beyond the fetched page, so "no_board" must not read as certain.
+    async def paged_kanban(project_key: str, *, max_results: int = 50) -> dict[str, Any]:
+        return {"isLast": False, "values": [{"id": 1, "name": "K", "type": "kanban"}]}
+
+    monkeypatch.setattr(fake, "get_boards", paged_kanban)
+    result = asyncio.run(_fn(server.find_sprints)("BL", None))
+    assert result["status"] == "no_board"
+    assert result["boards_truncated"] is True
+
+
+def test_set_sprint_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.set_sprint)("BL-1", 77, None))
+    assert ("set_sprint", "77", "BL-1") in fake.calls  # numeric id stringified
+    assert result["status"] == "sprint_set"
+    assert result["sprint_id"] == "77"
+    assert result["url"].endswith("/browse/BL-1")
+
+
+def test_set_sprint_rejects_non_numeric(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="numeric sprint id"):
+        asyncio.run(_fn(server.set_sprint)("BL-1", "Sprint 7", None))
+    assert fake.calls == []
 
 
 def test_find_issues_status_category_russian_alias(fake: FakeAdapter) -> None:

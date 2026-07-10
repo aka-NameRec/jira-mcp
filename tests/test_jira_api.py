@@ -432,3 +432,125 @@ def test_non_2xx_raises_jira_api_error() -> None:
     with pytest.raises(JiraApiError) as exc:
         asyncio.run(scenario())
     assert "400" in str(exc.value)
+
+
+def test_get_link_types_reads() -> None:
+    seen, handler = _capture(
+        200,
+        json_body={
+            "issueLinkTypes": [
+                {"id": "1", "name": "Blocks", "outward": "blocks", "inward": "is blocked by"}
+            ]
+        },
+    )
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler)
+        try:
+            return await adapter.get_link_types()
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/api/2/issueLinkType")
+    assert result["issueLinkTypes"][0]["name"] == "Blocks"
+
+
+def test_create_issue_link_posts_body_with_comment() -> None:
+    seen, handler = _capture(201)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler, deployment="dc")
+        try:
+            await adapter.create_issue_link(
+                "Blocks", inward_issue="BL-2", outward_issue="BL-1", comment="why"
+            )
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/rest/api/2/issueLink")
+    assert seen["body"] == {
+        "type": {"name": "Blocks"},
+        "inwardIssue": {"key": "BL-2"},
+        "outwardIssue": {"key": "BL-1"},
+        "comment": {"body": "why"},  # DC / API v2 uses a plain string
+    }
+
+
+def test_create_issue_link_omits_comment_when_absent() -> None:
+    seen, handler = _capture(201)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.create_issue_link("Relates", inward_issue="BL-2", outward_issue="BL-1")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert "comment" not in seen["body"]
+
+
+def test_get_priorities_reads_array() -> None:
+    seen, handler = _capture(200, json_body=[{"id": "2", "name": "High"}, {"id": "1", "name": "Highest"}])
+
+    async def scenario() -> Any:
+        adapter = await _make_adapter(handler)
+        try:
+            return await adapter.get_priorities()
+        finally:
+            await adapter.aclose()
+
+    result = asyncio.run(scenario())
+    assert seen["path"].endswith("/rest/api/2/priority")
+    assert [p["name"] for p in result] == ["High", "Highest"]  # top-level array
+
+
+def test_get_boards_uses_agile_absolute_url() -> None:
+    seen, handler = _capture(200, json_body={"values": []})
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.get_boards("BL")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "GET"
+    assert seen["path"].endswith("/rest/agile/1.0/board")  # outside /rest/api/2
+    assert seen["params"]["projectKeyOrId"] == "BL"
+
+
+def test_get_board_sprints_passes_state() -> None:
+    seen, handler = _capture(200, json_body={"values": []})
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.get_board_sprints(414, state="active,future")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["path"].endswith("/rest/agile/1.0/board/414/sprint")
+    assert seen["params"]["state"] == "active,future"
+
+
+def test_add_issue_to_sprint_posts_issues() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.add_issue_to_sprint(77, "BL-1")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/rest/agile/1.0/sprint/77/issue")
+    assert seen["body"] == {"issues": ["BL-1"]}
