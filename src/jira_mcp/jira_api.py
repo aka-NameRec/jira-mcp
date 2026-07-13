@@ -87,6 +87,14 @@ class JiraAdapter(Protocol):
 
     async def add_issue_to_sprint(self, sprint_id: int | str, issue_key: str) -> None: ...
 
+    async def delete_issue_link(self, link_id: str) -> None: ...
+
+    async def move_to_backlog(self, issue_key: str) -> None: ...
+
+    async def delete_worklog(
+        self, issue_key: str, worklog_id: str, *, adjust_estimate: str = "auto"
+    ) -> None: ...
+
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None: ...
 
     def build_api_issue_url(self, issue_key: str) -> str: ...
@@ -343,6 +351,27 @@ class BaseJiraApiClient:
         # directly (no field id needed).
         await self._send(
             "POST", self._agile_url(f"/sprint/{sprint_id}/issue"), json={"issues": [issue_key]}
+        )
+
+    async def delete_issue_link(self, link_id: str) -> None:
+        # DELETE returns 204 No Content on success. The link id comes from an issue's issuelinks.
+        await self._send("DELETE", f"/issueLink/{link_id}")
+
+    async def move_to_backlog(self, issue_key: str) -> None:
+        # Agile: moving an issue to the backlog removes it from its sprint. POST returns 204.
+        await self._send(
+            "POST", self._agile_url("/backlog/issue"), json={"issues": [issue_key]}
+        )
+
+    async def delete_worklog(
+        self, issue_key: str, worklog_id: str, *, adjust_estimate: str = "auto"
+    ) -> None:
+        # DELETE returns 204 No Content. `adjustEstimate` (query param) is "auto" (give the
+        # deleted time back to the remaining estimate) or "leave" (keep it unchanged).
+        await self._send(
+            "DELETE",
+            f"/issue/{issue_key}/worklog/{worklog_id}",
+            params={"adjustEstimate": adjust_estimate},
         )
 
     def make_absolute_url(self, maybe_relative_url: str | None) -> str | None:

@@ -554,3 +554,50 @@ def test_add_issue_to_sprint_posts_issues() -> None:
     assert seen["method"] == "POST"
     assert seen["path"].endswith("/rest/agile/1.0/sprint/77/issue")
     assert seen["body"] == {"issues": ["BL-1"]}
+
+
+def test_delete_issue_link_issues_delete() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.delete_issue_link("1001")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "DELETE"
+    assert seen["path"].endswith("/rest/api/2/issueLink/1001")
+
+
+def test_move_to_backlog_posts_issues() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.move_to_backlog("BL-1")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/rest/agile/1.0/backlog/issue")  # outside /rest/api/2
+    assert seen["body"] == {"issues": ["BL-1"]}
+
+
+def test_delete_worklog_issues_delete_with_adjust() -> None:
+    seen, handler = _capture(204)
+
+    async def scenario() -> None:
+        adapter = await _make_adapter(handler)
+        try:
+            await adapter.delete_worklog("BL-1", "700", adjust_estimate="leave")
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(scenario())
+    assert seen["method"] == "DELETE"
+    assert seen["path"].endswith("/rest/api/2/issue/BL-1/worklog/700")
+    assert seen["params"]["adjustEstimate"] == "leave"

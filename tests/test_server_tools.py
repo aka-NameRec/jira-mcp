@@ -172,6 +172,42 @@ class FakeAdapter:
     async def add_issue_to_sprint(self, sprint_id: int | str, issue_key: str) -> None:
         self.calls.append(("set_sprint", sprint_id, issue_key))
 
+    async def get_issue(self, issue_key: str) -> dict[str, Any]:
+        # BL-2 has two links (Blocks + Duplicate) to exercise the ambiguous path; BL-3 has one.
+        return {
+            "key": issue_key,
+            "fields": {
+                "issuelinks": [
+                    {
+                        "id": "1001",
+                        "type": {"name": "Blocks", "outward": "blocks", "inward": "is blocked by"},
+                        "outwardIssue": {"key": "BL-2"},
+                    },
+                    {
+                        "id": "1002",
+                        "type": {"name": "Relates", "outward": "relates to", "inward": "relates to"},
+                        "inwardIssue": {"key": "BL-3"},
+                    },
+                    {
+                        "id": "1003",
+                        "type": {"name": "Duplicate", "outward": "duplicates", "inward": "is duplicated by"},
+                        "outwardIssue": {"key": "BL-2"},
+                    },
+                ]
+            },
+        }
+
+    async def delete_issue_link(self, link_id: str) -> None:
+        self.calls.append(("delete_link", link_id))
+
+    async def move_to_backlog(self, issue_key: str) -> None:
+        self.calls.append(("backlog", issue_key))
+
+    async def delete_worklog(
+        self, issue_key: str, worklog_id: str, *, adjust_estimate: str = "auto"
+    ) -> None:
+        self.calls.append(("delete_worklog", issue_key, worklog_id, adjust_estimate))
+
     async def get_create_meta(self, project_key: str, *, expand: str | None = None) -> dict[str, Any]:
         return {
             "projects": [
@@ -731,6 +767,64 @@ def test_set_sprint_tool(fake: FakeAdapter) -> None:
 def test_set_sprint_rejects_non_numeric(fake: FakeAdapter) -> None:
     with pytest.raises(ValueError, match="numeric sprint id"):
         asyncio.run(_fn(server.set_sprint)("BL-1", "Sprint 7", None))
+    assert fake.calls == []
+
+
+def test_unlink_issues_single_match(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.unlink_issues)("BL-1", "BL-3", None))
+    assert ("delete_link", "1002") in fake.calls  # the one Relates link to BL-3
+    assert result["status"] == "unlinked"
+    assert result["count"] == 1
+    assert result["removed"][0]["direction"] == "inward"
+
+
+def test_unlink_issues_ambiguous_type_asks(fake: FakeAdapter) -> None:
+    # BL-2 is connected by both Blocks and Duplicate -> refuse and list, don't guess.
+    result = asyncio.run(_fn(server.unlink_issues)("BL-1", "BL-2", None))
+    assert result["status"] == "ambiguous_link_type"
+    assert set(result["candidates"]) == {"Blocks", "Duplicate"}
+    assert not any(c[0] == "delete_link" for c in fake.calls)  # nothing deleted
+
+
+def test_unlink_issues_type_disambiguates(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.unlink_issues)("BL-1", "BL-2", None, "Blocks"))
+    assert [c for c in fake.calls if c[0] == "delete_link"] == [("delete_link", "1001")]
+    assert result["count"] == 1
+
+
+def test_unlink_issues_no_link_raises(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="No link"):
+        asyncio.run(_fn(server.unlink_issues)("BL-1", "BL-999", None))
+
+
+def test_remove_from_sprint_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.remove_from_sprint)("BL-1", None))
+    assert ("backlog", "BL-1") in fake.calls
+    assert result["status"] == "removed_from_sprint"
+    assert result["url"].endswith("/browse/BL-1")
+
+
+def test_delete_worklog_tool(fake: FakeAdapter) -> None:
+    result = asyncio.run(_fn(server.delete_worklog)("BL-1", "700", None))
+    assert ("delete_worklog", "BL-1", "700", "auto") in fake.calls
+    assert result["status"] == "worklog_deleted"
+    assert result["worklog_id"] == "700"
+
+
+def test_delete_worklog_leave_mode(fake: FakeAdapter) -> None:
+    asyncio.run(_fn(server.delete_worklog)("BL-1", "700", None, adjust_estimate="leave"))
+    assert fake.calls[-1] == ("delete_worklog", "BL-1", "700", "leave")
+
+
+def test_delete_worklog_rejects_bad_adjust(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="adjust_estimate must be one of"):
+        asyncio.run(_fn(server.delete_worklog)("BL-1", "700", None, adjust_estimate="manual"))
+    assert fake.calls == []
+
+
+def test_delete_worklog_rejects_empty_id(fake: FakeAdapter) -> None:
+    with pytest.raises(ValueError, match="non-empty worklog_id"):
+        asyncio.run(_fn(server.delete_worklog)("BL-1", "  ", None))
     assert fake.calls == []
 
 

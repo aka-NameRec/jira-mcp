@@ -28,9 +28,11 @@ mcp = FastMCP(
         "find_issues, search_users, list_worklogs, whoami, list_issue_types, "
         "get_create_metadata, list_link_types, list_priorities, find_sprints) do not mutate. "
         "Write tools (update_issue, add_comment, delete_comment, transition_issue, "
-        "create_issue, log_work, assign_issue, unassign_issue, link_issues, set_sprint) change "
-        "real issues — use only with explicit user intent, and confirm before destructive or "
-        "hard-to-reverse actions.\n"
+        "create_issue, log_work, assign_issue, unassign_issue, link_issues, set_sprint, "
+        "unlink_issues, remove_from_sprint, delete_worklog) change real issues — use only with "
+        "explicit user intent, and confirm before destructive or hard-to-reverse actions. Each "
+        "of link_issues / set_sprint / log_work has an inverse for cleanup: unlink_issues / "
+        "remove_from_sprint / delete_worklog.\n"
         "Common recipes (compose small tools; there is no mega-tool):\n"
         "- Create a task for a teammate, in a sprint, with priority and estimate: search_users "
         "-> confirm the person -> create_issue(fields={'priority': {'name': 'High'}, "
@@ -70,8 +72,11 @@ mcp = FastMCP(
         "Sub-tasks follow their parent's sprint — set_sprint on a sub-task reports success but "
         "does not move it; sprint the parent instead.\n"
         "- Priority names are instance-specific — call list_priorities before setting one.\n"
-        "- delete_comment is irreversible; create_issue has no delete (cancel instead); "
-        "notify_users=false needs Jira admin rights."
+        "- unlink_issues removes the link(s) between two issues; if several link types connect "
+        "them it returns status='ambiguous_link_type' and asks for link_type — don't guess. "
+        "delete_worklog takes a worklog_id from list_worklogs.\n"
+        "- delete_comment is irreversible; create_issue has no delete (cancel via transition "
+        "instead); notify_users=false needs Jira admin rights."
     ),
     json_response=True,
 )
@@ -1242,6 +1247,140 @@ async def set_sprint(issue_key_or_url: str, sprint: str | int, ctx: Context) -> 
                 "issue_key": issue_key,
                 "status": "sprint_set",
                 "sprint_id": sprint_id,
+                "url": _browse_url(profile, issue_key),
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def unlink_issues(
+    issue_key_or_url: str,
+    related_issue: str,
+    ctx: Context,
+    link_type: str | None = None,
+) -> dict[str, Any]:
+    """Remove the link(s) between two issues (the undo of link_issues).
+
+    Reads `issue_key_or_url`'s links, finds the one(s) connecting it to `related_issue`, and
+    deletes them. If several link types connect the pair, pass `link_type` (a type name, e.g.
+    "Blocks") to choose which; without it the tool refuses and lists the types rather than
+    guessing. Find the pair with get_issue_for_review. Re-create a link with link_issues.
+    """
+    del ctx
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            if _is_url(related_issue):
+                _, related_key = parse_issue_url_parts(related_issue)
+            else:
+                related_key = related_issue.strip().upper()
+            issue = await adapter.get_issue(issue_key)
+            links = (issue.get("fields") or {}).get("issuelinks") or []
+            wanted_type = link_type.strip().lower() if link_type else None
+            matches: list[dict[str, Any]] = []
+            for link in links:
+                other = link.get("outwardIssue") or link.get("inwardIssue") or {}
+                if other.get("key") != related_key:
+                    continue
+                type_name = (link.get("type") or {}).get("name")
+                if wanted_type and str(type_name).strip().lower() != wanted_type:
+                    continue
+                matches.append(
+                    {
+                        "id": str(link.get("id")),
+                        "type": type_name,
+                        "direction": "outward" if link.get("outwardIssue") else "inward",
+                    }
+                )
+            if not matches:
+                suffix = f" of type '{link_type}'" if link_type else ""
+                raise ValueError(
+                    f"No link{suffix} between {issue_key} and {related_key}. "
+                    "Check the pair with get_issue_for_review."
+                )
+            if wanted_type is None and len({m["type"] for m in matches}) > 1:
+                return {
+                    "status": "ambiguous_link_type",
+                    "issue_key": issue_key,
+                    "related_issue": related_key,
+                    "candidates": sorted({str(m["type"]) for m in matches}),
+                    "hint": (
+                        "Several link types connect these issues. Pass link_type to choose which "
+                        "to remove; do not guess."
+                    ),
+                    "url": _browse_url(profile, issue_key),
+                }
+            for match in matches:
+                await adapter.delete_issue_link(match["id"])
+            return {
+                "status": "unlinked",
+                "issue_key": issue_key,
+                "related_issue": related_key,
+                "removed": matches,
+                "count": len(matches),
+                "url": _browse_url(profile, issue_key),
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def remove_from_sprint(issue_key_or_url: str, ctx: Context) -> dict[str, Any]:
+    """Move an issue out of its sprint, back to the backlog (the undo of set_sprint).
+
+    Uses the Agile backlog endpoint. Sub-tasks follow their parent's sprint, so target a
+    standard issue — on a sub-task this has no independent effect.
+    """
+    del ctx
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            await adapter.move_to_backlog(issue_key)
+            return {
+                "issue_key": issue_key,
+                "status": "removed_from_sprint",
+                "url": _browse_url(profile, issue_key),
+            }
+        finally:
+            await adapter.aclose()
+    except (ConfigError, JiraApiError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@mcp.tool()
+async def delete_worklog(
+    issue_key_or_url: str,
+    worklog_id: str,
+    ctx: Context,
+    adjust_estimate: str = "auto",
+) -> dict[str, Any]:
+    """Delete a worklog entry from an issue (the undo of log_work).
+
+    `worklog_id` comes from list_worklogs. `adjust_estimate` is "auto" (give the deleted time
+    back to the remaining estimate, default) or "leave" (keep it unchanged). Irreversible —
+    re-add with log_work if needed.
+    """
+    del ctx
+    if adjust_estimate not in _ADJUST_ESTIMATE_MODES:
+        raise ValueError(
+            f"adjust_estimate must be one of {_ADJUST_ESTIMATE_MODES}; got '{adjust_estimate}'."
+        )
+    worklog_id = str(worklog_id).strip()
+    if not worklog_id:
+        raise ValueError("delete_worklog needs a non-empty worklog_id; get it from list_worklogs.")
+    try:
+        profile, adapter, issue_key = await _resolve_issue_context(issue_key_or_url)
+        try:
+            await adapter.delete_worklog(issue_key, worklog_id, adjust_estimate=adjust_estimate)
+            return {
+                "issue_key": issue_key,
+                "status": "worklog_deleted",
+                "worklog_id": worklog_id,
                 "url": _browse_url(profile, issue_key),
             }
         finally:

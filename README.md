@@ -56,6 +56,7 @@ Write (mutate real Jira — use with explicit intent):
 - `assign_issue` / `unassign_issue` — assign to a user by the `assignee` value from `search_users`, or clear it.
 - `link_issues` — link two issues ("outward `<type>` inward", e.g. `Blocks`); accepts a type name or a directional phrase (an inward phrase auto-swaps the two issues).
 - `set_sprint` — move an issue into a sprint by its numeric id (from `find_sprints`).
+- `unlink_issues` / `remove_from_sprint` / `delete_worklog` — the inverses of `link_issues` / `set_sprint` / `log_work`, for cleanup.
 
 ## Usage & safety
 
@@ -70,6 +71,7 @@ Write tools change real Jira issues. Use them only with explicit user intent and
 - **Estimate vs deadline vs logged time (three different things).** A bare duration like `2h` is an *original estimate* — `update_issue`/`create_issue` `fields={"timetracking": {"originalEstimate": "2h"}}`. A calendar *deadline* is `fields={"duedate": "YYYY-MM-DD"}`. Time *already spent* is `log_work`. If the user just says "set 2h", ask whether that's the estimate or a due date.
 - **Linking issues.** `link_issues(outward_issue, inward_issue, link_type)` reads "outward `<type>` inward". Pass a `link_type` name or a directional phrase from `list_link_types`; naming the inward phrase swaps the two issues so the sentence still holds. Both issues must be on the same instance.
 - **Sprints (Jira Software).** `find_sprints(project)` lists candidate sprints from the project's scrum boards (kanban boards have none); if several match, it asks which rather than guessing. `set_sprint(issue, sprint_id)` uses the Agile endpoint, so no Sprint field id is needed. **Sub-tasks follow their parent's sprint** — `set_sprint` on a sub-task returns success but does not move it; sprint the parent instead. Priority names for `{"priority": {"name": ...}}` come from `list_priorities` (this instance has both `High` and `Highest`).
+- **Undo / cleanup.** `unlink_issues(issue, related_issue[, link_type])` reads the issue's links, finds the one(s) to `related_issue`, and deletes them; if several link types connect the pair it returns `ambiguous_link_type` and asks for `link_type` rather than guessing. `remove_from_sprint(issue)` moves an issue back to the backlog (sub-tasks follow their parent, so it has no independent effect on a sub-task). `delete_worklog(issue, worklog_id)` removes a worklog entry (`worklog_id` from `list_worklogs`; `adjust_estimate` `auto`/`leave`).
 - **Irreversibility.** `delete_comment` is permanent; `create_issue` has no delete (cancel instead).
 - **`notify_users=false`** requires Jira admin rights (403 otherwise) — leave the default.
 - **Field aliases.** `update_issue` / `create_issue` accept `acceptance_criteria` / `business_context` / `design_links`, mapped to the profile's `field_mappings` customfield ids.
